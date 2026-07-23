@@ -16,6 +16,29 @@ const PORT = 3000;
 
 app.use(express.json());
 
+// The iOS app loads its UI from a custom "hiddn://app" origin, so every
+// request it makes here is cross-origin as far as WebKit is concerned.
+// Without these headers, WebKit silently blocks the requests (or their
+// responses) before the app ever sees an error, which looks identical to
+// the server being unreachable. There's no cookie-based session here (auth
+// is a Bearer token the client sends explicitly), so a permissive origin is
+// low-risk.
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") {
+    res.sendStatus(204);
+    return;
+  }
+  next();
+});
+
+app.use((req, res, next) => {
+  console.log(`[REQUEST] ${req.method} ${req.path}`);
+  next();
+});
+
 // --- Accounts: database, auth, and email setup -----------------------------
 
 const pool = process.env.DATABASE_URL
