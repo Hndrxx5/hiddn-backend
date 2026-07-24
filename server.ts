@@ -86,6 +86,25 @@ function requireAuth(req: AuthedRequest, res: express.Response, next: express.Ne
   }
 }
 
+const DEFAULT_AVATAR_PALETTE = [
+  "#ef4444", "#3b82f6", "#10b981", "#f59e0b", "#8b5cf6", "#ec4899",
+  "#06b6d4", "#f97316", "#14b8a6", "#a855f7", "#22c55e", "#6366f1",
+];
+
+function generateDefaultAvatar(seed: string): string {
+  let hash = 0;
+  for (let i = 0; i < seed.length; i++) {
+    hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
+  }
+  const color = DEFAULT_AVATAR_PALETTE[hash % DEFAULT_AVATAR_PALETTE.length];
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+    <circle cx="50" cy="50" r="48" fill="${color}" />
+    <circle cx="50" cy="50" r="22" fill="none" stroke="white" stroke-width="3" stroke-opacity="0.8" />
+    <circle cx="50" cy="50" r="5" fill="white" />
+  </svg>`;
+  return `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`;
+}
+
 function toPublicUser(row: any) {
   return {
     id: row.id,
@@ -2374,10 +2393,11 @@ app.post("/api/register", authRateLimiter, async (req, res) => {
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
+    const defaultAvatar = generateDefaultAvatar(email);
     const result = await pool!.query(
-      `insert into users (email, password_hash, username) values ($1, $2, $3)
+      `insert into users (email, password_hash, username, avatar_url) values ($1, $2, $3, $4)
        returning id, email, username, bio, avatar_url, location, website, created_at`,
-      [email, passwordHash, username]
+      [email, passwordHash, username, defaultAvatar]
     );
     const user = toPublicUser(result.rows[0]);
     const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: "90d" });
