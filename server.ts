@@ -8,6 +8,7 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
 import { Resend } from "resend";
+import rateLimit from "express-rate-limit";
 
 dotenv.config();
 
@@ -53,6 +54,17 @@ const resendClient = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_
 function accountsAvailable(): boolean {
   return !!pool && !!JWT_SECRET;
 }
+
+// Applied to login/register/password-reset endpoints: 10 attempts per 15
+// minutes per IP. Generous enough for a real user who mistypes a password a
+// few times, tight enough to make brute-forcing impractical.
+const authRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many attempts. Please wait a few minutes and try again." },
+});
 
 interface AuthedRequest extends express.Request {
   userId?: string;
@@ -1552,7 +1564,7 @@ async function syncLatestDrops() {
           const releaseDateObj = new Date(releaseDateStr);
           if (isNaN(releaseDateObj.getTime())) continue;
 
-          const diffMs = newestFeedTime - releaseDateObj.getTime();
+          const diffMs = now.getTime() - releaseDateObj.getTime();
           const diffDays = diffMs / (1000 * 60 * 60 * 24);
 
           // Only keep items released within 14 days of the newest release in the feed
@@ -1615,7 +1627,7 @@ async function syncLatestDrops() {
           const releaseDateObj = new Date(releaseDateStr);
           if (isNaN(releaseDateObj.getTime())) continue;
 
-          const diffMs = newestFeedTime - releaseDateObj.getTime();
+          const diffMs = now.getTime() - releaseDateObj.getTime();
           const diffDays = diffMs / (1000 * 60 * 60 * 24);
 
           // Only keep items released within 14 days of the newest release in the feed
@@ -2336,7 +2348,7 @@ Archivist:`;
 
 // --- Accounts: register / login / password reset ---------------------------
 
-app.post("/api/register", async (req, res) => {
+app.post("/api/register", authRateLimiter, async (req, res) => {
   if (!accountsAvailable()) {
     res.status(503).json({ error: "Accounts are not configured on this server yet." });
     return;
@@ -2386,7 +2398,7 @@ app.post("/api/register", async (req, res) => {
   }
 });
 
-app.post("/api/login", async (req, res) => {
+app.post("/api/login", authRateLimiter, async (req, res) => {
   if (!accountsAvailable()) {
     res.status(503).json({ error: "Accounts are not configured on this server yet." });
     return;
@@ -2434,7 +2446,182 @@ app.get("/api/me", requireAuth, async (req: AuthedRequest, res) => {
   }
 });
 
-app.post("/api/forgot-password", async (req, res) => {
+// Required by App Store Review Guideline 5.1.1(v): any app that supports
+// account creation must also let the user delete their account from within
+// the app. This permanently removes the account and requires the correct
+// current password as confirmation, since deletion is irreversible.
+app.post("/api/delete-account", authRateLimiter, requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const password = String(req.body?.password || "");
+    if (!password) {
+      res.status(400).json({ error: "Please confirm your password to delete your account." });
+      return;
+    }
+
+    const result = await pool!.query("select * from users where id = $1", [req.userId]);
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "Account no longer exists." });
+      return;
+    }
+    const row = result.rows[0];
+    const matches = await bcrypt.compare(password, row.password_hash);
+    if (!matches) {
+      res.status(401).json({ error: "Incorrect password." });
+      return;
+    }
+
+    // password_reset_tokens rows for this user are removed automatically
+    // via the "on delete cascade" foreign key set up in the schema.
+    await pool!.query("delete from users where id = $1", [req.userId]);
+
+    sendEmail(
+      row.email,
+      "Your hiddn account has been deleted",
+      `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;">
+        <h2>Account deleted</h2>
+        <p>Your hiddn account (${row.email}) and all associated data have been permanently deleted, as requested.</p>
+        <p>If you didn't request this, please contact ${EMAIL_FROM} immediately.</p>
+      </div>`
+    );
+
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("Delete account error:", error);
+    res.status(500).json({ error: "Failed to delete account", details: error.message });
+  }
+});
+
+// --- Content moderation: reporting and blocking -----------------------------
+// Required for App Store Guideline 1.2 (User Generated Content): users must
+// be able to report objectionable content/users and block abusive users.
+
+app.post("/api/report", authRateLimiter, requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const reportedUserEmail = String(req.body?.reportedUserEmail || "").trim().toLowerCase();
+    const reason = String(req.body?.reason || "").trim();
+    const details = String(req.body?.details || "").trim();
+    const contentType = String(req.body?.contentType || "profile").trim();
+    const contentId = String(req.body?.contentId || "").trim();
+
+    if (!reportedUserEmail || !reason) {
+      res.status(400).json({ error: "A reason is required to submit a report." });
+      return;
+    }
+
+    const reportedResult = await pool!.query("select id from users where email = $1", [reportedUserEmail]);
+    if (reportedResult.rows.length === 0) {
+      res.status(404).json({ error: "That account could not be found." });
+      return;
+    }
+    const reportedUserId = reportedResult.rows[0].id;
+
+    if (reportedUserId === req.userId) {
+      res.status(400).json({ error: "You can't report your own account." });
+      return;
+    }
+
+    await pool!.query(
+      `insert into reports (reporter_id, reported_user_id, reason, details, content_type, content_id)
+       values ($1, $2, $3, $4, $5, $6)`,
+      [req.userId, reportedUserId, reason, details, contentType, contentId]
+    );
+
+    console.log(`[MODERATION] Report submitted: reporter=${req.userId} reported=${reportedUserId} reason="${reason}"`);
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("Report submission error:", error);
+    res.status(500).json({ error: "Failed to submit report", details: error.message });
+  }
+});
+
+app.post("/api/block", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const blockedUserEmail = String(req.body?.blockedUserEmail || "").trim().toLowerCase();
+    if (!blockedUserEmail) {
+      res.status(400).json({ error: "No account specified to block." });
+      return;
+    }
+
+    const blockedResult = await pool!.query("select id from users where email = $1", [blockedUserEmail]);
+    if (blockedResult.rows.length === 0) {
+      res.status(404).json({ error: "That account could not be found." });
+      return;
+    }
+    const blockedUserId = blockedResult.rows[0].id;
+
+    if (blockedUserId === req.userId) {
+      res.status(400).json({ error: "You can't block your own account." });
+      return;
+    }
+
+    await pool!.query(
+      "insert into blocks (blocker_id, blocked_id) values ($1, $2) on conflict do nothing",
+      [req.userId, blockedUserId]
+    );
+
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("Block error:", error);
+    res.status(500).json({ error: "Failed to block account", details: error.message });
+  }
+});
+
+app.post("/api/unblock", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const blockedUserEmail = String(req.body?.blockedUserEmail || "").trim().toLowerCase();
+    if (!blockedUserEmail) {
+      res.status(400).json({ error: "No account specified to unblock." });
+      return;
+    }
+
+    const blockedResult = await pool!.query("select id from users where email = $1", [blockedUserEmail]);
+    if (blockedResult.rows.length === 0) {
+      res.status(404).json({ error: "That account could not be found." });
+      return;
+    }
+
+    await pool!.query(
+      "delete from blocks where blocker_id = $1 and blocked_id = $2",
+      [req.userId, blockedResult.rows[0].id]
+    );
+
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("Unblock error:", error);
+    res.status(500).json({ error: "Failed to unblock account", details: error.message });
+  }
+});
+
+app.get("/api/blocked-users", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const result = await pool!.query(
+      `select u.email from blocks b join users u on u.id = b.blocked_id where b.blocker_id = $1`,
+      [req.userId]
+    );
+    res.json({ blockedEmails: result.rows.map((r: any) => r.email) });
+  } catch (error: any) {
+    console.error("Fetch blocked users error:", error);
+    res.status(500).json({ error: "Failed to load blocked users", details: error.message });
+  }
+});
+
+app.post("/api/forgot-password", authRateLimiter, async (req, res) => {
   if (!accountsAvailable()) {
     res.status(503).json({ error: "Accounts are not configured on this server yet." });
     return;
@@ -2482,7 +2669,7 @@ app.post("/api/forgot-password", async (req, res) => {
   }
 });
 
-app.post("/api/reset-password", async (req, res) => {
+app.post("/api/reset-password", authRateLimiter, async (req, res) => {
   if (!accountsAvailable()) {
     res.status(503).json({ error: "Accounts are not configured on this server yet." });
     return;
@@ -2572,6 +2759,62 @@ app.get("/reset-password", (req, res) => {
   });
 </script>
 </body></html>`);
+});
+
+app.get("/privacy-policy", (req, res) => {
+  res.type("html").send(`<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>hiddn Privacy Policy</title>
+<style>
+  body{font-family:-apple-system,sans-serif;background:#0a0a0a;color:#e5e5e5;margin:0;padding:40px 20px;line-height:1.6;}
+  .wrap{max-width:640px;margin:0 auto;}
+  h1{font-size:24px;margin-bottom:4px;}
+  .updated{color:#888;font-size:13px;margin-bottom:32px;}
+  h2{font-size:17px;margin-top:32px;color:#fff;}
+  p,li{color:#bbb;font-size:15px;}
+  a{color:#f87171;}
+</style></head>
+<body><div class="wrap">
+  <h1>hiddn Privacy Policy</h1>
+  <p class="updated">Last updated: ${new Date().toISOString().slice(0, 10)}</p>
+
+  <p>hiddn ("we", "us") is a mobile app for logging, reviewing, and curating music. This page explains what information we collect, how we use it, and how you can control it.</p>
+
+  <h2>Information we collect</h2>
+  <ul>
+    <li><strong>Account information:</strong> the email address, username, and password you provide when you register. Your password is never stored in plain text — it's hashed before being saved.</li>
+    <li><strong>Profile information:</strong> anything you optionally add, such as a bio, profile photo, location, or website link.</li>
+    <li><strong>Activity data:</strong> your diary entries, reviews, ratings, and collections. Some of this data is currently stored locally on your device rather than on our servers.</li>
+  </ul>
+
+  <h2>How we use your information</h2>
+  <ul>
+    <li>To create and secure your account, and let you log in.</li>
+    <li>To send you account-related emails: a welcome email when you register, and password reset emails when you request them. We do not send marketing email.</li>
+    <li>To operate core app features, such as showing music data and your reviews.</li>
+  </ul>
+
+  <h2>Third-party services we use</h2>
+  <ul>
+    <li><strong>Supabase</strong> — hosts our account database.</li>
+    <li><strong>Resend</strong> — delivers our transactional emails (welcome, password reset).</li>
+    <li><strong>Apple/iTunes music catalog</strong> — supplies public album, artist, and track data.</li>
+    <li><strong>Google Gemini</strong> — powers optional AI features (such as review suggestions), when enabled.</li>
+  </ul>
+  <p>We do not sell your personal information, and we do not use it for advertising.</p>
+
+  <h2>Data retention and deletion</h2>
+  <p>You can permanently delete your account and associated account data at any time from within the app, under Profile → Settings → Delete Account. This action is immediate and cannot be undone.</p>
+
+  <h2>Children's privacy</h2>
+  <p>hiddn is not directed at children under 13, and we do not knowingly collect personal information from children under 13.</p>
+
+  <h2>Changes to this policy</h2>
+  <p>We may update this policy from time to time. Continued use of the app after changes are posted means you accept the updated policy.</p>
+
+  <h2>Contact us</h2>
+  <p>Questions about this policy or your data? Email us at <a href="mailto:support@hiddncomplexity.com">support@hiddncomplexity.com</a>.</p>
+</div></body></html>`);
 });
 
 
