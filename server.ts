@@ -111,7 +111,7 @@ function toPublicUser(row: any) {
     email: row.email,
     username: row.username,
     bio: row.bio || "",
-    avatarUrl: row.avatar_url || "",
+    avatarUrl: row.avatar_url || generateDefaultAvatar(row.email),
     location: row.location || "",
     website: row.website || "",
     createdAt: row.created_at,
@@ -2736,7 +2736,7 @@ app.get("/api/followers/:email", requireAuth, async (req: AuthedRequest, res) =>
       followers: listResult.rows.map((r: any) => ({
         email: r.email,
         username: r.username,
-        avatarUrl: r.avatar_url || "",
+        avatarUrl: r.avatar_url || generateDefaultAvatar(r.email),
         isFollowing: r.viewer_is_following,
       })),
     });
@@ -2852,7 +2852,7 @@ app.get("/api/search-users", requireAuth, async (req: AuthedRequest, res) => {
         email: r.email,
         username: r.username,
         bio: r.bio || "",
-        avatarUrl: r.avatar_url || "",
+        avatarUrl: r.avatar_url || generateDefaultAvatar(r.email),
       })),
     });
   } catch (error: any) {
