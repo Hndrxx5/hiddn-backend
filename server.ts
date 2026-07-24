@@ -2621,6 +2621,184 @@ app.get("/api/blocked-users", requireAuth, async (req: AuthedRequest, res) => {
   }
 });
 
+// --- Real follow relationships & public profile lookup ---------------------
+
+app.post("/api/follow", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const followedUserEmail = String(req.body?.followedUserEmail || "").trim().toLowerCase();
+    if (!followedUserEmail) {
+      res.status(400).json({ error: "No account specified to follow." });
+      return;
+    }
+    const target = await pool!.query("select id from users where email = $1", [followedUserEmail]);
+    if (target.rows.length === 0) {
+      res.status(404).json({ error: "That account could not be found." });
+      return;
+    }
+    const followedId = target.rows[0].id;
+    if (followedId === req.userId) {
+      res.status(400).json({ error: "You can't follow your own account." });
+      return;
+    }
+    await pool!.query(
+      "insert into follows (follower_id, followed_id) values ($1, $2) on conflict do nothing",
+      [req.userId, followedId]
+    );
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("Follow error:", error);
+    res.status(500).json({ error: "Failed to follow account", details: error.message });
+  }
+});
+
+app.post("/api/unfollow", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const followedUserEmail = String(req.body?.followedUserEmail || "").trim().toLowerCase();
+    if (!followedUserEmail) {
+      res.status(400).json({ error: "No account specified to unfollow." });
+      return;
+    }
+    const target = await pool!.query("select id from users where email = $1", [followedUserEmail]);
+    if (target.rows.length === 0) {
+      res.status(404).json({ error: "That account could not be found." });
+      return;
+    }
+    await pool!.query(
+      "delete from follows where follower_id = $1 and followed_id = $2",
+      [req.userId, target.rows[0].id]
+    );
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("Unfollow error:", error);
+    res.status(500).json({ error: "Failed to unfollow account", details: error.message });
+  }
+});
+
+// Returns up to 50 followers for a given account, plus the true total count
+// (which may be higher than the list returned).
+app.get("/api/followers/:email", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const email = String(req.params.email || "").trim().toLowerCase();
+    const target = await pool!.query("select id from users where email = $1", [email]);
+    if (target.rows.length === 0) {
+      res.status(404).json({ error: "That account could not be found." });
+      return;
+    }
+    const targetId = target.rows[0].id;
+
+    const countResult = await pool!.query("select count(*) from follows where followed_id = $1", [targetId]);
+    const totalCount = parseInt(countResult.rows[0].count, 10);
+
+    const listResult = await pool!.query(
+      `select u.email, u.username, u.avatar_url,
+              exists(select 1 from follows where follower_id = $2 and followed_id = u.id) as viewer_is_following
+       from follows f join users u on u.id = f.follower_id
+       where f.followed_id = $1
+       order by f.created_at desc
+       limit 50`,
+      [targetId, req.userId]
+    );
+
+    res.json({
+      totalCount,
+      followers: listResult.rows.map((r: any) => ({
+        email: r.email,
+        username: r.username,
+        avatarUrl: r.avatar_url || "",
+        isFollowing: r.viewer_is_following,
+      })),
+    });
+  } catch (error: any) {
+    console.error("Fetch followers error:", error);
+    res.status(500).json({ error: "Failed to load followers", details: error.message });
+  }
+});
+
+// Public profile lookup by email, so a real account can actually be found
+// and viewed (needed for follow/report/block to have something real to act
+// on, since the app's built-in sample "friends" aren't real accounts).
+app.get("/api/users/:email", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const email = String(req.params.email || "").trim().toLowerCase();
+    const result = await pool!.query("select * from users where email = $1", [email]);
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "No account found with that email." });
+      return;
+    }
+    const row = result.rows[0];
+
+    const followerCountResult = await pool!.query("select count(*) from follows where followed_id = $1", [row.id]);
+    const isFollowingResult = await pool!.query(
+      "select 1 from follows where follower_id = $1 and followed_id = $2",
+      [req.userId, row.id]
+    );
+
+    res.json({
+      user: {
+        ...toPublicUser(row),
+        followersCount: parseInt(followerCountResult.rows[0].count, 10),
+        isFollowing: isFollowingResult.rows.length > 0,
+      },
+    });
+  } catch (error: any) {
+    console.error("User lookup error:", error);
+    res.status(500).json({ error: "Failed to look up account", details: error.message });
+  }
+});
+
+// Search real registered accounts by username (partial match), so people can
+// actually find each other. Excludes the requester's own account.
+app.get("/api/search-users", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const q = String(req.query.q || "").trim();
+    if (q.length < 2) {
+      res.json({ users: [] });
+      return;
+    }
+    const result = await pool!.query(
+      `select id, email, username, bio, avatar_url
+       from users
+       where username ilike $1 and id != $2
+       order by username asc
+       limit 20`,
+      [`%${q}%`, req.userId]
+    );
+    res.json({
+      users: result.rows.map((r: any) => ({
+        email: r.email,
+        username: r.username,
+        bio: r.bio || "",
+        avatarUrl: r.avatar_url || "",
+      })),
+    });
+  } catch (error: any) {
+    console.error("Search users error:", error);
+    res.status(500).json({ error: "Failed to search accounts", details: error.message });
+  }
+});
+
+
+
 app.post("/api/forgot-password", authRateLimiter, async (req, res) => {
   if (!accountsAvailable()) {
     res.status(503).json({ error: "Accounts are not configured on this server yet." });
