@@ -2764,6 +2764,50 @@ app.get("/api/users/:email", requireAuth, async (req: AuthedRequest, res) => {
 
 // Search real registered accounts by username (partial match), so people can
 // actually find each other. Excludes the requester's own account.
+// Syncs profile edits (avatar, bio, location, website) to the server. Without
+// this, edits made via the app's Edit Profile screen only ever lived in
+// local storage, so other users searching/viewing this account would never
+// see an updated avatar or bio.
+app.patch("/api/profile", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const bio = req.body?.bio !== undefined ? String(req.body.bio).slice(0, 500) : undefined;
+    const avatarUrl = req.body?.avatarUrl !== undefined ? String(req.body.avatarUrl) : undefined;
+    const location = req.body?.location !== undefined ? String(req.body.location).slice(0, 200) : undefined;
+    const website = req.body?.website !== undefined ? String(req.body.website).slice(0, 300) : undefined;
+
+    const fields: string[] = [];
+    const values: any[] = [];
+    let i = 1;
+    if (bio !== undefined) { fields.push(`bio = $${i++}`); values.push(bio); }
+    if (avatarUrl !== undefined) { fields.push(`avatar_url = $${i++}`); values.push(avatarUrl); }
+    if (location !== undefined) { fields.push(`location = $${i++}`); values.push(location); }
+    if (website !== undefined) { fields.push(`website = $${i++}`); values.push(website); }
+
+    if (fields.length === 0) {
+      res.status(400).json({ error: "No profile fields provided to update." });
+      return;
+    }
+
+    values.push(req.userId);
+    const result = await pool!.query(
+      `update users set ${fields.join(", ")} where id = $${i} returning *`,
+      values
+    );
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "Account no longer exists." });
+      return;
+    }
+    res.json({ user: toPublicUser(result.rows[0]) });
+  } catch (error: any) {
+    console.error("Profile update error:", error);
+    res.status(500).json({ error: "Failed to update profile", details: error.message });
+  }
+});
+
 app.get("/api/search-users", requireAuth, async (req: AuthedRequest, res) => {
   if (!accountsAvailable()) {
     res.status(503).json({ error: "Accounts are not configured on this server yet." });
