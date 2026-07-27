@@ -126,6 +126,7 @@ function toPublicUser(row: any) {
     avatarUrl: row.avatar_url || generateDefaultAvatar(row.email),
     location: row.location || "",
     website: row.website || "",
+    favorites: row.favorites || [],
     createdAt: row.created_at,
   };
 }
@@ -2846,6 +2847,7 @@ app.patch("/api/profile", requireAuth, async (req: AuthedRequest, res) => {
     const avatarUrl = req.body?.avatarUrl !== undefined ? String(req.body.avatarUrl) : undefined;
     const location = req.body?.location !== undefined ? String(req.body.location).slice(0, 200) : undefined;
     const website = req.body?.website !== undefined ? String(req.body.website).slice(0, 300) : undefined;
+    const favorites = Array.isArray(req.body?.favorites) ? req.body.favorites : undefined;
 
     const fields: string[] = [];
     const values: any[] = [];
@@ -2854,6 +2856,7 @@ app.patch("/api/profile", requireAuth, async (req: AuthedRequest, res) => {
     if (avatarUrl !== undefined) { fields.push(`avatar_url = $${i++}`); values.push(avatarUrl); }
     if (location !== undefined) { fields.push(`location = $${i++}`); values.push(location); }
     if (website !== undefined) { fields.push(`website = $${i++}`); values.push(website); }
+    if (favorites !== undefined) { fields.push(`favorites = $${i++}`); values.push(JSON.stringify(favorites)); }
 
     if (fields.length === 0) {
       res.status(400).json({ error: "No profile fields provided to update." });
