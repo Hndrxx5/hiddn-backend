@@ -2404,6 +2404,12 @@ app.post("/api/register", authRateLimiter, async (req, res) => {
       return;
     }
 
+    const existingUsername = await pool!.query("select id from users where lower(username) = lower($1)", [username]);
+    if (existingUsername.rows.length > 0) {
+      res.status(409).json({ error: "This username is already taken. Please choose another." });
+      return;
+    }
+
     const passwordHash = await bcrypt.hash(password, 12);
     const defaultAvatar = generateDefaultAvatar(email);
     const result = await pool!.query(
@@ -2425,6 +2431,10 @@ app.post("/api/register", authRateLimiter, async (req, res) => {
 
     res.json({ token, user });
   } catch (error: any) {
+    if (error.code === "23505") {
+      res.status(409).json({ error: "This username is already taken. Please choose another." });
+      return;
+    }
     console.error("Register error:", error);
     res.status(500).json({ error: "Failed to create account", details: error.message });
   }
