@@ -70,7 +70,7 @@ interface AuthedRequest extends express.Request {
   userId?: string;
 }
 
-function requireAuth(req: AuthedRequest, res: express.Response, next: express.NextFunction) {
+async function requireAuth(req: AuthedRequest, res: express.Response, next: express.NextFunction) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
   if (!token) {
@@ -78,7 +78,19 @@ function requireAuth(req: AuthedRequest, res: express.Response, next: express.Ne
     return;
   }
   try {
-    const payload = jwt.verify(token, JWT_SECRET) as { userId: string };
+    const payload = jwt.verify(token, JWT_SECRET) as { userId: string; tokenVersion?: number };
+    if (pool) {
+      const result = await pool.query("select token_version from users where id = $1", [payload.userId]);
+      if (result.rows.length === 0) {
+        res.status(401).json({ error: "Account no longer exists." });
+        return;
+      }
+      const currentVersion = result.rows[0].token_version ?? 0;
+      if ((payload.tokenVersion ?? 0) !== currentVersion) {
+        res.status(401).json({ error: "This session has been signed out. Please log in again." });
+        return;
+      }
+    }
     req.userId = payload.userId;
     next();
   } catch {
@@ -2400,7 +2412,7 @@ app.post("/api/register", authRateLimiter, async (req, res) => {
       [email, passwordHash, username, defaultAvatar]
     );
     const user = toPublicUser(result.rows[0]);
-    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: "90d" });
+    const token = jwt.sign({ userId: user.id, tokenVersion: 0 }, JWT_SECRET, { expiresIn: "90d" });
 
     sendEmail(
       email,
@@ -2444,7 +2456,7 @@ app.post("/api/login", authRateLimiter, async (req, res) => {
     }
 
     const user = toPublicUser(row);
-    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: "90d" });
+    const token = jwt.sign({ userId: user.id, tokenVersion: row.token_version ?? 0 }, JWT_SECRET, { expiresIn: "90d" });
     res.json({ token, user });
   } catch (error: any) {
     console.error("Login error:", error);
@@ -2463,6 +2475,32 @@ app.get("/api/me", requireAuth, async (req: AuthedRequest, res) => {
   } catch (error: any) {
     console.error("Fetch profile error:", error);
     res.status(500).json({ error: "Failed to load account", details: error.message });
+  }
+});
+
+// Invalidates every session token issued for this account (e.g. a lost or
+// stolen device) by bumping token_version — all existing tokens immediately
+// fail requireAuth's version check. Issues a fresh token for the device that
+// made this request, so that device stays logged in.
+app.post("/api/sign-out-all-devices", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const result = await pool!.query(
+      "update users set token_version = token_version + 1 where id = $1 returning token_version",
+      [req.userId]
+    );
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "Account no longer exists." });
+      return;
+    }
+    const newToken = jwt.sign(
+      { userId: req.userId, tokenVersion: result.rows[0].token_version },
+      JWT_SECRET,
+      { expiresIn: "90d" }
+    );
+    res.json({ success: true, token: newToken });
+  } catch (error: any) {
+    console.error("Sign out all devices error:", error);
+    res.status(500).json({ error: "Failed to sign out other devices", details: error.message });
   }
 });
 
@@ -2828,6 +2866,57 @@ app.patch("/api/profile", requireAuth, async (req: AuthedRequest, res) => {
   }
 });
 
+// --- Cross-device sync for diary entries, reviews, and collections ---------
+// Rather than syncing on every individual edit (which would require hooking
+// into dozens of scattered places in the app), the client pushes its full
+// local diary/collections state at natural checkpoints (logout, app
+// backgrounding) and pulls it on login. This gives real cross-device
+// continuity and reinstall-survival without the risk of a full real-time
+// sync rewrite.
+
+app.get("/api/sync", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const result = await pool!.query("select sync_data from users where id = $1", [req.userId]);
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: "Account no longer exists." });
+      return;
+    }
+    res.json({ syncData: result.rows[0].sync_data || {} });
+  } catch (error: any) {
+    console.error("Fetch sync data error:", error);
+    res.status(500).json({ error: "Failed to load synced data", details: error.message });
+  }
+});
+
+app.post("/api/sync", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const syncData = req.body?.syncData;
+    if (!syncData || typeof syncData !== "object") {
+      res.status(400).json({ error: "syncData object is required." });
+      return;
+    }
+    // Guard against pathologically large payloads (e.g. runaway base64 images).
+    const size = JSON.stringify(syncData).length;
+    if (size > 8_000_000) {
+      res.status(413).json({ error: "Sync data too large." });
+      return;
+    }
+    await pool!.query("update users set sync_data = $1 where id = $2", [JSON.stringify(syncData), req.userId]);
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("Save sync data error:", error);
+    res.status(500).json({ error: "Failed to save synced data", details: error.message });
+  }
+});
+
 app.get("/api/search-users", requireAuth, async (req: AuthedRequest, res) => {
   if (!accountsAvailable()) {
     res.status(503).json({ error: "Accounts are not configured on this server yet." });
@@ -3056,6 +3145,67 @@ app.get("/privacy-policy", (req, res) => {
 
   <h2>Contact us</h2>
   <p>Questions about this policy or your data? Email us at <a href="mailto:support@hiddncomplexity.com">support@hiddncomplexity.com</a>.</p>
+</div></body></html>`);
+});
+
+app.get("/terms", (req, res) => {
+  res.type("html").send(`<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>hiddn Terms of Service</title>
+<style>
+  body{font-family:-apple-system,sans-serif;background:#0a0a0a;color:#e5e5e5;margin:0;padding:40px 20px;line-height:1.6;}
+  .wrap{max-width:640px;margin:0 auto;}
+  h1{font-size:24px;margin-bottom:4px;}
+  .updated{color:#888;font-size:13px;margin-bottom:32px;}
+  h2{font-size:17px;margin-top:32px;color:#fff;}
+  p,li{color:#bbb;font-size:15px;}
+  a{color:#f87171;}
+</style></head>
+<body><div class="wrap">
+  <h1>hiddn Terms of Service</h1>
+  <p class="updated">Last updated: ${new Date().toISOString().slice(0, 10)}</p>
+
+  <p>These Terms of Service ("Terms") govern your use of the hiddn app ("hiddn", "we", "us"). By creating an account or using the app, you agree to these Terms.</p>
+
+  <h2>Your account</h2>
+  <ul>
+    <li>You must provide accurate information when registering and keep your password secure.</li>
+    <li>You're responsible for all activity that happens under your account.</li>
+    <li>You must be at least 13 years old to use hiddn.</li>
+    <li>You can delete your account at any time from Profile → Settings → Delete Account.</li>
+  </ul>
+
+  <h2>Your content</h2>
+  <ul>
+    <li>You retain ownership of the reviews, ratings, and other content you post ("your content").</li>
+    <li>By posting content, you grant hiddn a license to display, distribute, and store it as part of operating the app.</li>
+    <li>You're solely responsible for your content. Don't post anything illegal, harassing, hateful, or infringing on others' rights.</li>
+  </ul>
+
+  <h2>Acceptable use</h2>
+  <p>You agree not to:</p>
+  <ul>
+    <li>Harass, abuse, or threaten other users.</li>
+    <li>Impersonate any person or entity, or misrepresent your affiliation with anyone.</li>
+    <li>Post spam, or use the app for unauthorized commercial purposes.</li>
+    <li>Attempt to gain unauthorized access to other accounts or to hiddn's systems.</li>
+  </ul>
+  <p>We may remove content or suspend or terminate accounts that violate these Terms. You can report content or accounts, and block other users, from within the app.</p>
+
+  <h2>Music and third-party data</h2>
+  <p>Album artwork, track listings, and related music metadata are sourced from Apple's music catalog and displayed for informational purposes. hiddn is not affiliated with Apple Inc.</p>
+
+  <h2>Disclaimer of warranties</h2>
+  <p>hiddn is provided "as is" without warranties of any kind, express or implied. We don't guarantee the app will be uninterrupted, error-free, or available at all times.</p>
+
+  <h2>Limitation of liability</h2>
+  <p>To the fullest extent permitted by law, hiddn and its operators are not liable for any indirect, incidental, or consequential damages arising from your use of the app.</p>
+
+  <h2>Changes to these Terms</h2>
+  <p>We may update these Terms from time to time. Continued use of the app after changes are posted means you accept the updated Terms.</p>
+
+  <h2>Contact us</h2>
+  <p>Questions about these Terms? Email us at <a href="mailto:support@hiddncomplexity.com">support@hiddncomplexity.com</a>.</p>
 </div></body></html>`);
 });
 
