@@ -3209,6 +3209,38 @@ app.get("/terms", (req, res) => {
 </div></body></html>`);
 });
 
+app.get("/support", (req, res) => {
+  res.type("html").send(`<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>hiddn Support</title>
+<style>
+  body{font-family:-apple-system,sans-serif;background:#0a0a0a;color:#e5e5e5;margin:0;padding:40px 20px;line-height:1.6;}
+  .wrap{max-width:560px;margin:0 auto;}
+  h1{font-size:24px;margin-bottom:4px;}
+  h2{font-size:17px;margin-top:28px;color:#fff;}
+  p{color:#bbb;font-size:15px;}
+  a{color:#f87171;}
+  .card{background:#121214;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:20px;margin-top:16px;}
+</style></head>
+<body><div class="wrap">
+  <h1>hiddn Support</h1>
+  <p>Need help with the app, have a question, or want to report a problem? We're here to help.</p>
+
+  <div class="card">
+    <h2>Contact us</h2>
+    <p>Email <a href="mailto:support@hiddncomplexity.com">support@hiddncomplexity.com</a> and we'll get back to you as soon as we can.</p>
+  </div>
+
+  <h2>Common questions</h2>
+  <p><strong>How do I delete my account?</strong><br>Open the app, go to Profile → Settings → Delete Account. This permanently removes your account and data, and can't be undone.</p>
+  <p><strong>How do I report or block someone?</strong><br>On any user's profile, use the Report or Block buttons near the top of the page.</p>
+  <p><strong>I forgot my password.</strong><br>On the login screen, tap "Forgot Password" and follow the emailed reset link.</p>
+
+  <h2>Other links</h2>
+  <p><a href="/privacy-policy">Privacy Policy</a> &nbsp;•&nbsp; <a href="/terms">Terms of Service</a></p>
+</div></body></html>`);
+});
+
 
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
