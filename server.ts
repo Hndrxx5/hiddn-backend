@@ -2795,6 +2795,48 @@ app.get("/api/followers/:email", requireAuth, async (req: AuthedRequest, res) =>
   }
 });
 
+app.get("/api/following/:email", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const email = String(req.params.email || "").trim().toLowerCase();
+    const target = await pool!.query("select id from users where email = $1", [email]);
+    if (target.rows.length === 0) {
+      res.status(404).json({ error: "That account could not be found." });
+      return;
+    }
+    const targetId = target.rows[0].id;
+
+    const countResult = await pool!.query("select count(*) from follows where follower_id = $1", [targetId]);
+    const totalCount = parseInt(countResult.rows[0].count, 10);
+
+    const listResult = await pool!.query(
+      `select u.email, u.username, u.avatar_url,
+              exists(select 1 from follows where follower_id = $2 and followed_id = u.id) as viewer_is_following
+       from follows f join users u on u.id = f.followed_id
+       where f.follower_id = $1
+       order by f.created_at desc
+       limit 50`,
+      [targetId, req.userId]
+    );
+
+    res.json({
+      totalCount,
+      following: listResult.rows.map((r: any) => ({
+        email: r.email,
+        username: r.username,
+        avatarUrl: r.avatar_url || generateDefaultAvatar(r.email),
+        isFollowing: r.viewer_is_following,
+      })),
+    });
+  } catch (error: any) {
+    console.error("Fetch following error:", error);
+    res.status(500).json({ error: "Failed to load following", details: error.message });
+  }
+});
+
 // Public profile lookup by email, so a real account can actually be found
 // and viewed (needed for follow/report/block to have something real to act
 // on, since the app's built-in sample "friends" aren't real accounts).
