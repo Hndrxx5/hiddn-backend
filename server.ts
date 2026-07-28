@@ -2760,10 +2760,63 @@ app.get("/api/community-feed", requireAuth, async (req: AuthedRequest, res) => {
 
     feed.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
 
-    res.json({ reviews: feed.slice(0, 100) });
+    const trimmed = feed.slice(0, 100);
+    if (trimmed.length > 0) {
+      const reviewIds = trimmed.map((r) => r.id);
+      const likeCounts = await pool!.query(
+        "select review_id, count(*) as count from review_likes where review_id = any($1) group by review_id",
+        [reviewIds]
+      );
+      const viewerLikes = await pool!.query(
+        "select review_id from review_likes where user_id = $1 and review_id = any($2)",
+        [req.userId, reviewIds]
+      );
+      const countMap = new Map(likeCounts.rows.map((r: any) => [r.review_id, parseInt(r.count, 10)]));
+      const likedSet = new Set(viewerLikes.rows.map((r: any) => r.review_id));
+      for (const r of trimmed) {
+        r.likes = countMap.get(r.id) || 0;
+        r.likedByUser = likedSet.has(r.id);
+      }
+    }
+
+    res.json({ reviews: trimmed });
   } catch (error: any) {
     console.error("Community feed error:", error);
     res.status(500).json({ error: "Failed to load community feed", details: error.message });
+  }
+});
+
+app.post("/api/review-likes/toggle", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const reviewId = String(req.body?.reviewId || "").trim();
+    if (!reviewId) {
+      res.status(400).json({ error: "reviewId is required." });
+      return;
+    }
+    const existing = await pool!.query(
+      "select 1 from review_likes where user_id = $1 and review_id = $2",
+      [req.userId, reviewId]
+    );
+    let liked: boolean;
+    if (existing.rows.length > 0) {
+      await pool!.query("delete from review_likes where user_id = $1 and review_id = $2", [req.userId, reviewId]);
+      liked = false;
+    } else {
+      await pool!.query(
+        "insert into review_likes (user_id, review_id) values ($1, $2) on conflict do nothing",
+        [req.userId, reviewId]
+      );
+      liked = true;
+    }
+    const countResult = await pool!.query("select count(*) from review_likes where review_id = $1", [reviewId]);
+    res.json({ liked, likes: parseInt(countResult.rows[0].count, 10) });
+  } catch (error: any) {
+    console.error("Toggle review like error:", error);
+    res.status(500).json({ error: "Failed to update like", details: error.message });
   }
 });
 
