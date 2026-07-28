@@ -2773,9 +2773,15 @@ app.get("/api/community-feed", requireAuth, async (req: AuthedRequest, res) => {
       );
       const countMap = new Map(likeCounts.rows.map((r: any) => [r.review_id, parseInt(r.count, 10)]));
       const likedSet = new Set(viewerLikes.rows.map((r: any) => r.review_id));
+      const commentCounts = await pool!.query(
+        "select review_id, count(*) as count from review_comments where review_id = any($1) group by review_id",
+        [reviewIds]
+      );
+      const commentCountMap = new Map(commentCounts.rows.map((r: any) => [r.review_id, parseInt(r.count, 10)]));
       for (const r of trimmed) {
         r.likes = countMap.get(r.id) || 0;
         r.likedByUser = likedSet.has(r.id);
+        r.commentCount = commentCountMap.get(r.id) || 0;
       }
     }
 
@@ -2813,10 +2819,130 @@ app.post("/api/review-likes/toggle", requireAuth, async (req: AuthedRequest, res
       liked = true;
     }
     const countResult = await pool!.query("select count(*) from review_likes where review_id = $1", [reviewId]);
+
+    if (liked) {
+      const ownerResult = await pool!.query(
+        `select id, sync_data from users where sync_data->'diary' @> $1::jsonb and id != $2`,
+        [JSON.stringify([{ id: reviewId }]), req.userId]
+      );
+      if (ownerResult.rows.length > 0) {
+        const ownerRow = ownerResult.rows[0];
+        const diary = ownerRow.sync_data && Array.isArray(ownerRow.sync_data.diary) ? ownerRow.sync_data.diary : [];
+        const reviewEntry = diary.find((e: any) => e && e.id === reviewId);
+        await pool!.query(
+          "insert into notifications (user_id, type, from_user_id, album_data) values ($1, 'like', $2, $3)",
+          [ownerRow.id, req.userId, reviewEntry && reviewEntry.album ? JSON.stringify(reviewEntry.album) : null]
+        );
+      }
+    }
+
     res.json({ liked, likes: parseInt(countResult.rows[0].count, 10) });
   } catch (error: any) {
     console.error("Toggle review like error:", error);
     res.status(500).json({ error: "Failed to update like", details: error.message });
+  }
+});
+
+app.get("/api/comments/:reviewId", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const reviewId = String(req.params.reviewId || "").trim();
+    const result = await pool!.query(
+      `select c.id, c.text, c.created_at, c.user_id,
+              u.email, u.username, u.avatar_url
+       from review_comments c join users u on u.id = c.user_id
+       where c.review_id = $1
+       order by c.created_at asc
+       limit 200`,
+      [reviewId]
+    );
+    res.json({
+      comments: result.rows.map((r: any) => ({
+        id: r.id,
+        text: r.text,
+        createdAt: r.created_at,
+        isOwn: r.user_id === req.userId,
+        user: {
+          email: r.email,
+          username: r.username,
+          avatarUrl: r.avatar_url || generateDefaultAvatar(r.email),
+        },
+      })),
+    });
+  } catch (error: any) {
+    console.error("Fetch comments error:", error);
+    res.status(500).json({ error: "Failed to load comments", details: error.message });
+  }
+});
+
+app.post("/api/comments", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const reviewId = String(req.body?.reviewId || "").trim();
+    const text = String(req.body?.text || "").trim().slice(0, 1000);
+    if (!reviewId || !text) {
+      res.status(400).json({ error: "reviewId and text are required." });
+      return;
+    }
+
+    const insertResult = await pool!.query(
+      "insert into review_comments (user_id, review_id, text) values ($1, $2, $3) returning id, created_at",
+      [req.userId, reviewId, text]
+    );
+
+    const commenterResult = await pool!.query("select email, username, avatar_url from users where id = $1", [req.userId]);
+    const commenter = commenterResult.rows[0];
+
+    const ownerResult = await pool!.query(
+      `select id, sync_data from users where sync_data->'diary' @> $1::jsonb and id != $2`,
+      [JSON.stringify([{ id: reviewId }]), req.userId]
+    );
+    if (ownerResult.rows.length > 0) {
+      const ownerRow = ownerResult.rows[0];
+      const diary = ownerRow.sync_data && Array.isArray(ownerRow.sync_data.diary) ? ownerRow.sync_data.diary : [];
+      const reviewEntry = diary.find((e: any) => e && e.id === reviewId);
+      await pool!.query(
+        "insert into notifications (user_id, type, from_user_id, album_data) values ($1, 'comment', $2, $3)",
+        [ownerRow.id, req.userId, reviewEntry && reviewEntry.album ? JSON.stringify(reviewEntry.album) : null]
+      );
+    }
+
+    res.json({
+      comment: {
+        id: insertResult.rows[0].id,
+        text,
+        createdAt: insertResult.rows[0].created_at,
+        isOwn: true,
+        user: {
+          email: commenter.email,
+          username: commenter.username,
+          avatarUrl: commenter.avatar_url || generateDefaultAvatar(commenter.email),
+        },
+      },
+    });
+  } catch (error: any) {
+    console.error("Post comment error:", error);
+    res.status(500).json({ error: "Failed to post comment", details: error.message });
+  }
+});
+
+app.delete("/api/comments/:id", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    await pool!.query("delete from review_comments where id = $1 and user_id = $2", [req.params.id, req.userId]);
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("Delete comment error:", error);
+    res.status(500).json({ error: "Failed to delete comment", details: error.message });
   }
 });
 
@@ -2827,7 +2953,7 @@ app.get("/api/notifications", requireAuth, async (req: AuthedRequest, res) => {
   }
   try {
     const result = await pool!.query(
-      `select n.id, n.type, n.is_read, n.created_at,
+      `select n.id, n.type, n.is_read, n.created_at, n.album_data,
               u.email as from_email, u.username as from_username, u.avatar_url as from_avatar_url
        from notifications n
        left join users u on u.id = n.from_user_id
@@ -2842,6 +2968,7 @@ app.get("/api/notifications", requireAuth, async (req: AuthedRequest, res) => {
         type: r.type,
         isRead: r.is_read,
         createdAt: r.created_at,
+        album: r.album_data || null,
         fromEmail: r.from_email,
         fromUsername: r.from_username,
         fromAvatarUrl: r.from_avatar_url || (r.from_email ? generateDefaultAvatar(r.from_email) : ""),
