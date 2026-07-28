@@ -2855,6 +2855,7 @@ app.get("/api/users/:email", requireAuth, async (req: AuthedRequest, res) => {
     const row = result.rows[0];
 
     const followerCountResult = await pool!.query("select count(*) from follows where followed_id = $1", [row.id]);
+    const followingCountResult = await pool!.query("select count(*) from follows where follower_id = $1", [row.id]);
     const isFollowingResult = await pool!.query(
       "select 1 from follows where follower_id = $1 and followed_id = $2",
       [req.userId, row.id]
@@ -2864,6 +2865,7 @@ app.get("/api/users/:email", requireAuth, async (req: AuthedRequest, res) => {
       user: {
         ...toPublicUser(row),
         followersCount: parseInt(followerCountResult.rows[0].count, 10),
+        followingCount: parseInt(followingCountResult.rows[0].count, 10),
         isFollowing: isFollowingResult.rows.length > 0,
         reviews: (row.sync_data && Array.isArray(row.sync_data.diary)) ? row.sync_data.diary : [],
       },
