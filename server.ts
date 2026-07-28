@@ -2717,12 +2717,83 @@ app.post("/api/follow", requireAuth, async (req: AuthedRequest, res) => {
       "insert into follows (follower_id, followed_id) values ($1, $2) on conflict do nothing",
       [req.userId, followedId]
     );
+    await pool!.query(
+      "insert into notifications (user_id, type, from_user_id) values ($1, 'follow', $2)",
+      [followedId, req.userId]
+    );
     res.json({ success: true });
   } catch (error: any) {
     console.error("Follow error:", error);
     res.status(500).json({ error: "Failed to follow account", details: error.message });
   }
 });
+
+// --- Real notifications -----------------------------------------------------
+
+app.get("/api/notifications", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const result = await pool!.query(
+      `select n.id, n.type, n.is_read, n.created_at,
+              u.email as from_email, u.username as from_username, u.avatar_url as from_avatar_url
+       from notifications n
+       left join users u on u.id = n.from_user_id
+       where n.user_id = $1
+       order by n.created_at desc
+       limit 100`,
+      [req.userId]
+    );
+    res.json({
+      notifications: result.rows.map((r: any) => ({
+        id: r.id,
+        type: r.type,
+        isRead: r.is_read,
+        createdAt: r.created_at,
+        fromEmail: r.from_email,
+        fromUsername: r.from_username,
+        fromAvatarUrl: r.from_avatar_url || (r.from_email ? generateDefaultAvatar(r.from_email) : ""),
+      })),
+    });
+  } catch (error: any) {
+    console.error("Fetch notifications error:", error);
+    res.status(500).json({ error: "Failed to load notifications", details: error.message });
+  }
+});
+
+app.post("/api/notifications/:id/read", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    await pool!.query(
+      "update notifications set is_read = true where id = $1 and user_id = $2",
+      [req.params.id, req.userId]
+    );
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("Mark notification read error:", error);
+    res.status(500).json({ error: "Failed to update notification", details: error.message });
+  }
+});
+
+app.post("/api/notifications/read-all", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    await pool!.query("update notifications set is_read = true where user_id = $1", [req.userId]);
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("Mark all notifications read error:", error);
+    res.status(500).json({ error: "Failed to update notifications", details: error.message });
+  }
+});
+
 
 app.post("/api/unfollow", requireAuth, async (req: AuthedRequest, res) => {
   if (!accountsAvailable()) {
