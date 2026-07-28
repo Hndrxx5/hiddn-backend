@@ -15,7 +15,7 @@ dotenv.config();
 const app = express();
 const PORT = 3000;
 
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
 // The iOS app loads its UI from a custom "hiddn://app" origin, so every
 // request it makes here is cross-origin as far as WebKit is concerned.
