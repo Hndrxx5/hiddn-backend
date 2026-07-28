@@ -1402,6 +1402,7 @@ async function syncPopularReleases() {
         coverUrl: album.coverUrl,
         releaseYear: album.releaseYear,
         genres: album.genres,
+        genreKey: key,
         averageRating: parseFloat((4.5 + Math.random() * 0.4).toFixed(1)),
         reviewCount: Math.floor(1000 + Math.random() * 5000)
       };
@@ -1493,6 +1494,7 @@ async function syncLatestDrops() {
       `${name.toLowerCase().trim()} - ${artist.toLowerCase().trim()}`.replace(/[^a-z0-9]/g, "");
 
     // 1. Optional query to GET /v1/catalog/us/charts?types=albums&genre={genreId} if JWT is present
+    let realApiSucceeded = false;
     try {
       const token = process.env.APPLE_DEVELOPER_TOKEN || process.env.APPLE_MUSIC_JWT;
       if (token) {
@@ -1501,6 +1503,7 @@ async function syncLatestDrops() {
           headers: { "Authorization": `Bearer ${token}` }
         });
         if (res.ok) {
+          realApiSucceeded = true;
           const json = await res.json();
           const albumsData = json?.results?.albums?.[0]?.data || [];
           for (const item of albumsData) {
@@ -1547,8 +1550,10 @@ async function syncLatestDrops() {
       console.warn(`Apple Music Catalog API fetch failed for ${genreName}, falling back to iTunes public RSS feeds:`, err);
     }
 
-    // 2. Fetch public RSS top albums (which contain the hot & latest drops)
-    try {
+    // 2. Fetch public RSS top albums (which contain the hot & latest drops) —
+    // only used when the real Apple Music API didn't succeed, so genuine new
+    // releases never get diluted with unrelated popularity-chart data.
+    if (!realApiSucceeded) try {
       const v2TopAlbumsUrl = "https://rss.applemarketingtools.com/api/v2/us/music/most-played/100/albums.json";
       const v2Res = await fetch(v2TopAlbumsUrl);
       if (v2Res.ok) {
@@ -1621,8 +1626,8 @@ async function syncLatestDrops() {
       console.warn(`RSS V2 feed failed for ${genreName}:`, err);
     }
 
-    // 3. Fetch iTunes RSS v1 Top Albums
-    try {
+    // 3. Fetch iTunes RSS v1 Top Albums — same rule, only as a last resort.
+    if (!realApiSucceeded) try {
       const v1TopAlbumsUrl = genreId 
         ? `https://itunes.apple.com/us/rss/topalbums/genre=${genreId}/limit=100/json`
         : "https://itunes.apple.com/us/rss/topalbums/limit=100/json";
@@ -1803,8 +1808,11 @@ async function syncLatestDrops() {
       seenKeys.add(getAlbumKey(album.name, album.artist));
     });
 
-    // Fallback Mocking if feeds are down or return nothing within the strict period
-    if (freshFetchedAlbums.length < 4) {
+    // Fallback Mocking — only when the real Apple Music API genuinely didn't
+    // work (no token, network failure, etc). A real API success with fewer
+    // than 4 results is an honest "not much dropped this week," not a
+    // reason to pad the list with curated data that isn't from this week.
+    if (!realApiSucceeded && freshFetchedAlbums.length < 4) {
       console.log(`Generating high-fidelity fallback drops for ${genreName} strictly within the 14-day filter...`);
       
       let recentFallbackList = curatedLatestDrops[cacheKey] || [];
@@ -1963,7 +1971,15 @@ app.get("/api/popular-releases", async (req, res) => {
       await syncPopularReleases();
     }
 
-    res.json({ results: popularReleasesCache[cacheKey] || [] });
+    const rawResults = popularReleasesCache[cacheKey] || [];
+    // Defensive filter: only return albums whose stored genreKey actually
+    // matches what was requested. Guarantees correctness even if the cache
+    // ever ends up with something misfiled, rather than trusting it blindly.
+    const results = cacheKey === "all"
+      ? rawResults
+      : rawResults.filter((a: any) => a.genreKey === cacheKey);
+
+    res.json({ results });
   } catch (error: any) {
     console.error("Error serving popular releases:", error);
     res.status(500).json({ error: "Failed to load popular releases", details: error.message });
