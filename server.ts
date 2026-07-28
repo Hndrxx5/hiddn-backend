@@ -2730,6 +2730,43 @@ app.post("/api/follow", requireAuth, async (req: AuthedRequest, res) => {
 
 // --- Real notifications -----------------------------------------------------
 
+// Real reviews from people you follow, for the Community Feed tab.
+app.get("/api/community-feed", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const followedResult = await pool!.query(
+      `select u.id, u.email, u.username, u.avatar_url, u.sync_data
+       from follows f join users u on u.id = f.followed_id
+       where f.follower_id = $1`,
+      [req.userId]
+    );
+
+    const feed: any[] = [];
+    for (const row of followedResult.rows) {
+      const diary = row.sync_data && Array.isArray(row.sync_data.diary) ? row.sync_data.diary : [];
+      for (const entry of diary) {
+        if (!entry || !entry.album || !entry.album.name) continue;
+        feed.push({
+          ...entry,
+          userId: row.email,
+          userUsername: row.username,
+          userAvatarUrl: row.avatar_url || generateDefaultAvatar(row.email),
+        });
+      }
+    }
+
+    feed.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+
+    res.json({ reviews: feed.slice(0, 100) });
+  } catch (error: any) {
+    console.error("Community feed error:", error);
+    res.status(500).json({ error: "Failed to load community feed", details: error.message });
+  }
+});
+
 app.get("/api/notifications", requireAuth, async (req: AuthedRequest, res) => {
   if (!accountsAvailable()) {
     res.status(503).json({ error: "Accounts are not configured on this server yet." });
