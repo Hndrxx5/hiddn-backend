@@ -2008,6 +2008,7 @@ async function syncLatestDrops() {
 }
 
 app.get("/api/latest-drops", async (req, res) => {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate");
   try {
     const genreParam = (req.query.genre as string || "").toLowerCase().trim();
     
@@ -2053,6 +2054,7 @@ app.get("/api/latest-drops", async (req, res) => {
 });
 
 app.get("/api/popular-releases", async (req, res) => {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate");
   try {
     const genreParam = (req.query.genre as string || "").toLowerCase().trim();
     
