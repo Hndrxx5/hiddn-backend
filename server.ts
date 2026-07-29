@@ -1189,6 +1189,86 @@ const curatedLatestDrops: Record<string, any[]> = {
 };
 
 // Automated database sync routine for popular classics (popular_releases table)
+// Maps a genre bucket key to substrings we'll match against an album's
+// free-text genre tags (e.g. "Hip-Hop/Rap" should match the "hip-hop" bucket).
+const POPULAR_GENRE_MATCHERS: Record<string, string[]> = {
+  "rock": ["rock"],
+  "alternative": ["alternative", "indie"],
+  "country": ["country"],
+  "electronic": ["electronic", "edm", "dance"],
+  "hip-hop": ["hip-hop", "hip hop", "rap"],
+  "pop": ["pop"],
+  "r&b": ["r&b", "rnb", "soul"],
+};
+
+async function computeRealPopularAlbums(): Promise<Record<string, any[]>> {
+  const byGenre: Record<string, any[]> = {};
+  if (!pool) return byGenre;
+
+  try {
+    const usersResult = await pool.query(
+      "select sync_data from users where sync_data is not null and jsonb_array_length(coalesce(sync_data->'diary', '[]'::jsonb)) > 0"
+    );
+
+    const albumMap = new Map<string, {
+      id: string; name: string; artist: string; coverUrl: string; releaseYear: string; genres: string[]; ratingSum: number; reviewCount: number;
+    }>();
+
+    for (const row of usersResult.rows) {
+      const diary = row.sync_data && Array.isArray(row.sync_data.diary) ? row.sync_data.diary : [];
+      for (const entry of diary) {
+        if (!entry || !entry.album || !entry.album.name) continue;
+        const album = entry.album;
+        const key = album.id
+          ? `id:${album.id}`
+          : `na:${`${album.name}${album.artist || ""}`.toLowerCase().replace(/[^a-z0-9]/g, "")}`;
+
+        if (!albumMap.has(key)) {
+          albumMap.set(key, {
+            id: album.id || key,
+            name: album.name,
+            artist: album.artist || "Unknown Artist",
+            coverUrl: album.coverUrl || "",
+            releaseYear: album.releaseYear || "",
+            genres: Array.isArray(album.genres) ? album.genres : [],
+            ratingSum: 0,
+            reviewCount: 0,
+          });
+        }
+
+        const entryData = albumMap.get(key)!;
+        entryData.reviewCount += 1;
+        if (typeof entry.rating === "number") {
+          entryData.ratingSum += entry.rating;
+        }
+      }
+    }
+
+    const allAlbums = Array.from(albumMap.values()).map(a => ({
+      id: a.id,
+      name: a.name,
+      artist: a.artist,
+      coverUrl: a.coverUrl,
+      releaseYear: a.releaseYear,
+      genres: a.genres,
+      reviewCount: a.reviewCount,
+      averageRating: a.reviewCount > 0 ? parseFloat((a.ratingSum / a.reviewCount).toFixed(1)) : 0,
+    }));
+
+    for (const [genreKey, matchers] of Object.entries(POPULAR_GENRE_MATCHERS)) {
+      const matched = allAlbums.filter(a =>
+        a.genres.some(g => matchers.some(m => g.toLowerCase().includes(m)))
+      );
+      matched.sort((a, b) => b.reviewCount - a.reviewCount || b.averageRating - a.averageRating);
+      byGenre[genreKey] = matched;
+    }
+  } catch (error: any) {
+    console.error("computeRealPopularAlbums error:", error);
+  }
+
+  return byGenre;
+}
+
 async function syncPopularReleases() {
   console.log("\n===================================================================");
   console.log("🔥 RUNNING POPULAR CLASSICS BACKEND SYNC (popular_releases) 🔥");
@@ -1391,8 +1471,22 @@ async function syncPopularReleases() {
   console.log("[SQL EXEC] CREATE TABLE IF NOT EXISTS popular_releases (id VARCHAR(255) PRIMARY KEY, name VARCHAR(255), artist VARCHAR(255), cover_url TEXT, release_year VARCHAR(10), genres TEXT[], genre_key VARCHAR(50));");
   console.log("[SQL EXEC] DELETE FROM popular_releases;");
 
+  const realAlbumsByGenre = await computeRealPopularAlbums();
+  const REAL_DATA_THRESHOLD = 3;
+
   for (const [key, albums] of Object.entries(realPopularAlbums)) {
-    popularReleasesCache[key] = albums.map(album => {
+    const realForGenre = realAlbumsByGenre[key] || [];
+    const useReal = realForGenre.length >= REAL_DATA_THRESHOLD;
+
+    const sourceAlbums = useReal
+      ? realForGenre
+      : albums.map(album => ({
+          ...album,
+          averageRating: parseFloat((4.5 + Math.random() * 0.4).toFixed(1)),
+          reviewCount: Math.floor(1000 + Math.random() * 5000),
+        }));
+
+    popularReleasesCache[key] = sourceAlbums.map(album => {
       console.log(`[SQL EXEC] INSERT INTO popular_releases (id, name, artist, cover_url, release_year, genres, genre_key) VALUES ('${album.id}', '${album.name.replace(/'/g, "''")}', '${album.artist.replace(/'/g, "''")}', '${album.coverUrl}', '${album.releaseYear}', ARRAY['${album.genres.join("','")}'], '${key}');`);
       
       return {
@@ -1403,8 +1497,8 @@ async function syncPopularReleases() {
         releaseYear: album.releaseYear,
         genres: album.genres,
         genreKey: key,
-        averageRating: parseFloat((4.5 + Math.random() * 0.4).toFixed(1)),
-        reviewCount: Math.floor(1000 + Math.random() * 5000)
+        averageRating: album.averageRating,
+        reviewCount: album.reviewCount,
       };
     });
   }
@@ -1939,7 +2033,19 @@ app.get("/api/latest-drops", async (req, res) => {
       await syncLatestDrops();
     }
 
-    res.json({ results: latestDropsCache[cacheKey] || [] });
+    // The cache only refreshes every 24 hours (or on deploy), but "new this
+    // week" needs to stay true on every single request in between — an
+    // album that was 3 days old when cached can quietly become 9 days old
+    // by the time someone actually looks at it. Re-check against the real
+    // current time here rather than trusting whatever was true at cache time.
+    const rawResults = latestDropsCache[cacheKey] || [];
+    const nowMs = Date.now();
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+    const freshResults = rawResults.filter((a: any) =>
+      typeof a.originalReleaseTime === "number" && (nowMs - a.originalReleaseTime) <= sevenDaysMs
+    );
+
+    res.json({ results: freshResults });
   } catch (error: any) {
     console.error("Error serving latest drops:", error);
     res.status(500).json({ error: "Failed to load latest drops", details: error.message });
