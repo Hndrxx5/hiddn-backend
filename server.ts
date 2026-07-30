@@ -452,7 +452,7 @@ async function fetchCatalogRaw({
   offset?: number;
 }) {
   const encodedQuery = encodeURIComponent(term.trim()).replace(/%20/g, "+");
-  const developerToken = process.env.APPLE_MUSIC_DEVELOPER_TOKEN;
+  const developerToken = process.env.APPLE_DEVELOPER_TOKEN;
 
   if (developerToken) {
     try {
@@ -2166,7 +2166,7 @@ app.get("/api/artists/:id", async (req, res) => {
   }
 
   const cleanId = id.startsWith("artist-") ? id.replace("artist-", "") : id;
-  const developerToken = process.env.APPLE_MUSIC_DEVELOPER_TOKEN;
+  const developerToken = process.env.APPLE_DEVELOPER_TOKEN;
 
   if (developerToken) {
     try {
