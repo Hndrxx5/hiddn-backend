@@ -2170,21 +2170,19 @@ app.get("/api/artists/:id", async (req, res) => {
 
   if (developerToken) {
     try {
-      // Fetch Artist, Albums, and Songs in parallel
+      // Fetch Artist and Albums in parallel — track count on each album
+      // entry is what actually distinguishes singles from full albums.
       const artistUrl = `https://api.music.apple.com/v1/catalog/${storefront}/artists/${cleanId}`;
       const albumsUrl = `https://api.music.apple.com/v1/catalog/${storefront}/artists/${cleanId}/albums?limit=50`;
-      const songsUrl = `https://api.music.apple.com/v1/catalog/${storefront}/artists/${cleanId}/songs?limit=50`;
 
-      const [artistRes, albumsRes, songsRes] = await Promise.all([
+      const [artistRes, albumsRes] = await Promise.all([
         fetch(artistUrl, { headers: { "Authorization": `Bearer ${developerToken}` } }),
-        fetch(albumsUrl, { headers: { "Authorization": `Bearer ${developerToken}` } }),
-        fetch(songsUrl, { headers: { "Authorization": `Bearer ${developerToken}` } })
+        fetch(albumsUrl, { headers: { "Authorization": `Bearer ${developerToken}` } })
       ]);
 
       if (artistRes.ok) {
         const artistData = await artistRes.json() as any;
         const albumsData = albumsRes.ok ? await albumsRes.json() as any : null;
-        const songsData = songsRes.ok ? await songsRes.json() as any : null;
 
         const artistItem = artistData.data?.[0];
         if (artistItem) {
@@ -2197,36 +2195,30 @@ app.get("/api/artists/:id", async (req, res) => {
           }
 
           const albums: any[] = [];
+          const singles: any[] = [];
           if (albumsData?.data) {
             albumsData.data.forEach((item: any) => {
               const artUrl = item.attributes?.artwork?.url || "";
               const coverUrl = artUrl ? artUrl.replace("{w}x{h}", "600x600") : "";
-              albums.push({
+              const trackCount = item.attributes?.trackCount ?? 0;
+              const entry = {
                 id: String(item.id),
                 name: item.attributes?.name || "Unknown Album",
                 artist: item.attributes?.artistName || artistName,
                 coverUrl,
                 releaseYear: item.attributes?.releaseDate ? item.attributes.releaseDate.split("-")[0] : "N/A",
                 genres: item.attributes?.genreNames || ["Music"],
-                type: "album"
-              });
-            });
-          }
-
-          const songs: any[] = [];
-          if (songsData?.data) {
-            songsData.data.forEach((item: any) => {
-              const artUrl = item.attributes?.artwork?.url || "";
-              const coverUrl = artUrl ? artUrl.replace("{w}x{h}", "600x600") : "";
-              songs.push({
-                id: `song-${item.id}`,
-                name: item.attributes?.name || "Unknown Song",
-                artist: item.attributes?.artistName || artistName,
-                coverUrl,
-                releaseYear: item.attributes?.releaseDate ? item.attributes.releaseDate.split("-")[0] : "N/A",
-                genres: item.attributes?.genreNames || ["Music"],
-                type: "song"
-              });
+                type: trackCount <= 1 ? "single" : "album"
+              };
+              // A real release with 1 track (or Apple not reporting a count)
+              // is a genuine single, not a full album — Apple's catalog
+              // models both as "album" resources, so track count is what
+              // actually distinguishes them.
+              if (trackCount <= 1) {
+                singles.push(entry);
+              } else {
+                albums.push(entry);
+              }
             });
           }
 
@@ -2238,7 +2230,7 @@ app.get("/api/artists/:id", async (req, res) => {
               imageUrl: artistImageUrl
             },
             albums,
-            singles: songs
+            singles
           });
         }
       }
