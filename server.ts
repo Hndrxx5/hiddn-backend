@@ -7,6 +7,7 @@ import { Pool } from "pg";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
+import http2 from "http2";
 import { Resend } from "resend";
 import rateLimit from "express-rate-limit";
 
@@ -50,6 +51,115 @@ const JWT_SECRET = process.env.JWT_SECRET || "";
 const EMAIL_FROM = process.env.EMAIL_FROM || "support@hiddncomplexity.com";
 const APP_URL = process.env.APP_URL || "";
 const resendClient = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+
+// --- Push notifications (APNs) ----------------------------------------------
+// Apple requires a fresh-ish provider JWT (they recommend not reusing one for
+// more than ~20 minutes), signed with an APNs auth key — same ES256 JWT
+// pattern as the Apple Music token, just with different claims. Cached and
+// regenerated only when it's actually gotten old, rather than per-request.
+
+let apnsJwtCache: { token: string; issuedAt: number } | null = null;
+
+function base64url(input: Buffer | string): string {
+  return Buffer.from(input)
+    .toString("base64")
+    .replace(/=+$/, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+}
+
+function getApnsJwt(): string | null {
+  const teamId = process.env.APNS_TEAM_ID;
+  const keyId = process.env.APNS_KEY_ID;
+  const privateKey = process.env.APNS_PRIVATE_KEY;
+  if (!teamId || !keyId || !privateKey) return null;
+
+  const now = Math.floor(Date.now() / 1000);
+  if (apnsJwtCache && now - apnsJwtCache.issuedAt < 60 * 15) {
+    return apnsJwtCache.token;
+  }
+
+  const header = { alg: "ES256", kid: keyId };
+  const payload = { iss: teamId, iat: now };
+  const signingInput = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(payload))}`;
+
+  // Render env vars can't hold real newlines cleanly, so the key is stored
+  // with literal "\n" sequences that need converting back before use.
+  const normalizedKey = privateKey.replace(/\\n/g, "\n");
+
+  const signature = crypto.sign("sha256", Buffer.from(signingInput), {
+    key: normalizedKey,
+    dsaEncoding: "ieee-p1363",
+  });
+
+  const token = `${signingInput}.${base64url(signature)}`;
+  apnsJwtCache = { token, issuedAt: now };
+  return token;
+}
+
+async function sendPushNotification(deviceToken: string, title: string, body: string, badge?: number): Promise<boolean> {
+  const jwtToken = getApnsJwt();
+  const bundleId = process.env.APNS_BUNDLE_ID || "com.hiddencomplexity.hiddn";
+  const apnsHost = process.env.APNS_HOST || "api.push.apple.com"; // use api.sandbox.push.apple.com while testing via Xcode/TestFlight if needed
+  if (!jwtToken) return false;
+
+  return new Promise((resolve) => {
+    try {
+      const client = http2.connect(`https://${apnsHost}`);
+      client.on("error", () => resolve(false));
+
+      const payload = JSON.stringify({
+        aps: {
+          alert: { title, body },
+          sound: "default",
+          ...(badge !== undefined ? { badge } : {}),
+        },
+      });
+
+      const req = client.request({
+        ":method": "POST",
+        ":path": `/3/device/${deviceToken}`,
+        authorization: `bearer ${jwtToken}`,
+        "apns-topic": bundleId,
+        "apns-push-type": "alert",
+        "content-type": "application/json",
+      });
+
+      let status = 0;
+      req.on("response", (headers) => {
+        status = Number(headers[":status"] || 0);
+      });
+      req.on("end", () => {
+        client.close();
+        resolve(status === 200);
+      });
+      req.on("error", () => {
+        client.close();
+        resolve(false);
+      });
+
+      req.write(payload);
+      req.end();
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+// Sends a push to every device registered for this user. Best-effort —
+// failures (including no APNs credentials configured) are swallowed so a
+// push failure never breaks the actual action (follow/like/comment).
+async function pushToUser(userId: string, title: string, body: string): Promise<void> {
+  if (!pool) return;
+  try {
+    const result = await pool.query("select device_token from device_tokens where user_id = $1", [userId]);
+    for (const row of result.rows) {
+      sendPushNotification(row.device_token, title, body).catch(() => {});
+    }
+  } catch (error) {
+    console.error("pushToUser error:", error);
+  }
+}
 
 function accountsAvailable(): boolean {
   return !!pool && !!JWT_SECRET;
@@ -2837,6 +2947,9 @@ app.post("/api/follow", requireAuth, async (req: AuthedRequest, res) => {
       "insert into notifications (user_id, type, from_user_id) values ($1, 'follow', $2)",
       [followedId, req.userId]
     );
+    const followerResult = await pool!.query("select username from users where id = $1", [req.userId]);
+    const followerName = followerResult.rows[0]?.username || "Someone";
+    pushToUser(followedId, "New Follower", `${followerName} started following you`).catch(() => {});
     res.json({ success: true });
   } catch (error: any) {
     console.error("Follow error:", error);
@@ -2949,6 +3062,10 @@ app.post("/api/review-likes/toggle", requireAuth, async (req: AuthedRequest, res
           "insert into notifications (user_id, type, from_user_id, album_data) values ($1, 'like', $2, $3)",
           [ownerRow.id, req.userId, reviewEntry && reviewEntry.album ? JSON.stringify(reviewEntry.album) : null]
         );
+        const likerResult = await pool!.query("select username from users where id = $1", [req.userId]);
+        const likerName = likerResult.rows[0]?.username || "Someone";
+        const albumName = reviewEntry && reviewEntry.album ? reviewEntry.album.name : "your review";
+        pushToUser(ownerRow.id, "New Like", `${likerName} liked your review of ${albumName}`).catch(() => {});
       }
     }
 
@@ -3027,6 +3144,8 @@ app.post("/api/comments", requireAuth, async (req: AuthedRequest, res) => {
         "insert into notifications (user_id, type, from_user_id, album_data) values ($1, 'comment', $2, $3)",
         [ownerRow.id, req.userId, reviewEntry && reviewEntry.album ? JSON.stringify(reviewEntry.album) : null]
       );
+      const albumName = reviewEntry && reviewEntry.album ? reviewEntry.album.name : "your review";
+      pushToUser(ownerRow.id, "New Comment", `${commenter.username} commented on your review of ${albumName}: "${text.slice(0, 80)}"`).catch(() => {});
     }
 
     res.json({
@@ -3059,6 +3178,28 @@ app.delete("/api/comments/:id", requireAuth, async (req: AuthedRequest, res) => 
   } catch (error: any) {
     console.error("Delete comment error:", error);
     res.status(500).json({ error: "Failed to delete comment", details: error.message });
+  }
+});
+
+app.post("/api/register-device-token", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const deviceToken = String(req.body?.deviceToken || "").trim();
+    if (!deviceToken) {
+      res.status(400).json({ error: "deviceToken is required." });
+      return;
+    }
+    await pool!.query(
+      "insert into device_tokens (user_id, device_token) values ($1, $2) on conflict do nothing",
+      [req.userId, deviceToken]
+    );
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("Register device token error:", error);
+    res.status(500).json({ error: "Failed to register device token", details: error.message });
   }
 });
 
