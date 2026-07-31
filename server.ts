@@ -2960,6 +2960,55 @@ app.post("/api/follow", requireAuth, async (req: AuthedRequest, res) => {
 // --- Real notifications -----------------------------------------------------
 
 // Real reviews from people you follow, for the Community Feed tab.
+// Fetch any single review by ID, regardless of who owns it — used when
+// navigating from a notification straight to the review it's about, since
+// that review might not be in the viewer's own community feed cache (most
+// notably, comments/likes on your own reviews never appear in your own feed).
+app.get("/api/review/:reviewId", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const reviewId = String(req.params.reviewId || "").trim();
+    const ownerResult = await pool!.query(
+      `select id, email, username, avatar_url, sync_data from users where sync_data->'diary' @> $1::jsonb`,
+      [JSON.stringify([{ id: reviewId }])]
+    );
+    if (ownerResult.rows.length === 0) {
+      res.status(404).json({ error: "That review could not be found." });
+      return;
+    }
+    const ownerRow = ownerResult.rows[0];
+    const diary = ownerRow.sync_data && Array.isArray(ownerRow.sync_data.diary) ? ownerRow.sync_data.diary : [];
+    const reviewEntry = diary.find((e: any) => e && e.id === reviewId);
+    if (!reviewEntry) {
+      res.status(404).json({ error: "That review could not be found." });
+      return;
+    }
+
+    const likeCountResult = await pool!.query("select count(*) from review_likes where review_id = $1", [reviewId]);
+    const viewerLikeResult = await pool!.query(
+      "select 1 from review_likes where user_id = $1 and review_id = $2",
+      [req.userId, reviewId]
+    );
+
+    res.json({
+      review: {
+        ...reviewEntry,
+        userId: ownerRow.email,
+        userUsername: ownerRow.username,
+        userAvatar: ownerRow.avatar_url || generateDefaultAvatar(ownerRow.email),
+        likes: parseInt(likeCountResult.rows[0].count, 10),
+        likedByUser: viewerLikeResult.rows.length > 0,
+      },
+    });
+  } catch (error: any) {
+    console.error("Fetch single review error:", error);
+    res.status(500).json({ error: "Failed to load review", details: error.message });
+  }
+});
+
 app.get("/api/community-feed", requireAuth, async (req: AuthedRequest, res) => {
   if (!accountsAvailable()) {
     res.status(503).json({ error: "Accounts are not configured on this server yet." });
@@ -3059,8 +3108,8 @@ app.post("/api/review-likes/toggle", requireAuth, async (req: AuthedRequest, res
         const diary = ownerRow.sync_data && Array.isArray(ownerRow.sync_data.diary) ? ownerRow.sync_data.diary : [];
         const reviewEntry = diary.find((e: any) => e && e.id === reviewId);
         await pool!.query(
-          "insert into notifications (user_id, type, from_user_id, album_data) values ($1, 'like', $2, $3)",
-          [ownerRow.id, req.userId, reviewEntry && reviewEntry.album ? JSON.stringify(reviewEntry.album) : null]
+          "insert into notifications (user_id, type, from_user_id, album_data, review_id) values ($1, 'like', $2, $3, $4)",
+          [ownerRow.id, req.userId, reviewEntry && reviewEntry.album ? JSON.stringify(reviewEntry.album) : null, reviewId]
         );
         const likerResult = await pool!.query("select username from users where id = $1", [req.userId]);
         const likerName = likerResult.rows[0]?.username || "Someone";
@@ -3141,8 +3190,8 @@ app.post("/api/comments", requireAuth, async (req: AuthedRequest, res) => {
       const diary = ownerRow.sync_data && Array.isArray(ownerRow.sync_data.diary) ? ownerRow.sync_data.diary : [];
       const reviewEntry = diary.find((e: any) => e && e.id === reviewId);
       await pool!.query(
-        "insert into notifications (user_id, type, from_user_id, album_data) values ($1, 'comment', $2, $3)",
-        [ownerRow.id, req.userId, reviewEntry && reviewEntry.album ? JSON.stringify(reviewEntry.album) : null]
+        "insert into notifications (user_id, type, from_user_id, album_data, review_id) values ($1, 'comment', $2, $3, $4)",
+        [ownerRow.id, req.userId, reviewEntry && reviewEntry.album ? JSON.stringify(reviewEntry.album) : null, reviewId]
       );
       const albumName = reviewEntry && reviewEntry.album ? reviewEntry.album.name : "your review";
       pushToUser(ownerRow.id, "New Comment", `${commenter.username} commented on your review of ${albumName}: "${text.slice(0, 80)}"`).catch(() => {});
@@ -3210,8 +3259,9 @@ app.get("/api/notifications", requireAuth, async (req: AuthedRequest, res) => {
   }
   try {
     const result = await pool!.query(
-      `select n.id, n.type, n.is_read, n.created_at, n.album_data,
-              u.email as from_email, u.username as from_username, u.avatar_url as from_avatar_url
+      `select n.id, n.type, n.is_read, n.created_at, n.album_data, n.review_id,
+              u.email as from_email, u.username as from_username, u.avatar_url as from_avatar_url,
+              exists(select 1 from follows where follower_id = $1 and followed_id = n.from_user_id) as already_following
        from notifications n
        left join users u on u.id = n.from_user_id
        where n.user_id = $1
@@ -3226,6 +3276,8 @@ app.get("/api/notifications", requireAuth, async (req: AuthedRequest, res) => {
         isRead: r.is_read,
         createdAt: r.created_at,
         album: r.album_data || null,
+        reviewId: r.review_id || null,
+        alreadyFollowing: r.already_following,
         fromEmail: r.from_email,
         fromUsername: r.from_username,
         fromAvatarUrl: r.from_avatar_url || (r.from_email ? generateDefaultAvatar(r.from_email) : ""),
