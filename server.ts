@@ -3718,7 +3718,8 @@ app.get("/privacy-policy", (req, res) => {
   <ul>
     <li><strong>Account information:</strong> the email address, username, and password you provide when you register. Your password is never stored in plain text — it's hashed before being saved.</li>
     <li><strong>Profile information:</strong> anything you optionally add, such as a bio, profile photo, location, or website link.</li>
-    <li><strong>Activity data:</strong> your diary entries, reviews, ratings, and collections. Some of this data is currently stored locally on your device rather than on our servers.</li>
+    <li><strong>Activity data:</strong> your diary entries, reviews, ratings, likes, comments, and collections, synced to our servers so your data is available across devices and visible to other users where the app is designed to show it (such as your public reviews and profile).</li>
+    <li><strong>Push notification token:</strong> if you allow notifications, we store a device token (provided by Apple) used only to deliver notifications to your device, such as when someone follows you, likes your review, or comments on it. This token is not used for any other purpose.</li>
   </ul>
 
   <h2>How we use your information</h2>
@@ -3726,6 +3727,7 @@ app.get("/privacy-policy", (req, res) => {
     <li>To create and secure your account, and let you log in.</li>
     <li>To send you account-related emails: a welcome email when you register, and password reset emails when you request them. We do not send marketing email.</li>
     <li>To operate core app features, such as showing music data and your reviews.</li>
+    <li>To send push notifications you've opted into, such as new followers, likes, and comments. You can disable these at any time in your device's Settings app, under Notifications.</li>
   </ul>
 
   <h2>Third-party services we use</h2>
@@ -3733,6 +3735,7 @@ app.get("/privacy-policy", (req, res) => {
     <li><strong>Supabase</strong> — hosts our account database.</li>
     <li><strong>Resend</strong> — delivers our transactional emails (welcome, password reset).</li>
     <li><strong>Apple/iTunes music catalog</strong> — supplies public album, artist, and track data.</li>
+    <li><strong>Apple Push Notification service</strong> — delivers push notifications to your device, if enabled.</li>
     <li><strong>Google Gemini</strong> — powers optional AI features (such as review suggestions), when enabled.</li>
   </ul>
   <p>We do not sell your personal information, and we do not use it for advertising.</p>
