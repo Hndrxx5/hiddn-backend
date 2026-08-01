@@ -1702,7 +1702,7 @@ async function syncLatestDrops() {
     try {
       const token = process.env.APPLE_DEVELOPER_TOKEN || process.env.APPLE_MUSIC_JWT;
       if (token) {
-        const url = `https://api.music.apple.com/v1/catalog/us/charts?types=albums${genreId ? `&genre=${genreId}` : ""}&chart=new-releases&limit=20`;
+        const url = `https://api.music.apple.com/v1/catalog/us/charts?types=albums${genreId ? `&genre=${genreId}` : ""}&chart=new-releases&limit=30`;
         const res = await fetch(url, {
           headers: { "Authorization": `Bearer ${token}` }
         });
@@ -1718,7 +1718,12 @@ async function syncLatestDrops() {
             const coverUrl = formatAndValidateArtwork(attributes.artwork?.url);
             if (!coverUrl) continue; // Discard entire album instantly if artwork is missing or invalid
 
-            // Rule 2: Enforce strict 7-day recency filter
+            // Rule 2: Recency filter — widened from a strict 7 days to 21,
+            // since requiring "within the last week" made genre counts
+            // wildly inconsistent (sometimes 1-2 albums, sometimes 12+)
+            // depending on how much genuinely dropped that specific week.
+            // Still real, still recent — just not so narrow it starves
+            // slower genres/weeks down to almost nothing.
             const releaseDateStr = attributes.releaseDate || "";
             if (!releaseDateStr) continue;
 
@@ -1726,8 +1731,8 @@ async function syncLatestDrops() {
             const diffMs = now.getTime() - releaseDateObj.getTime();
             const diffDays = diffMs / (1000 * 60 * 60 * 24);
 
-            if (diffDays > 7 || diffDays < 0) {
-              continue; // Exclude older than 7 days completely
+            if (diffDays > 21 || diffDays < 0) {
+              continue; // Exclude anything older than 21 days
             }
 
             const id = String(item.id);
@@ -2151,9 +2156,9 @@ app.get("/api/latest-drops", async (req, res) => {
     // current time here rather than trusting whatever was true at cache time.
     const rawResults = latestDropsCache[cacheKey] || [];
     const nowMs = Date.now();
-    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+    const twentyOneDaysMs = 21 * 24 * 60 * 60 * 1000;
     const freshResults = rawResults.filter((a: any) =>
-      typeof a.originalReleaseTime === "number" && (nowMs - a.originalReleaseTime) <= sevenDaysMs
+      typeof a.originalReleaseTime === "number" && (nowMs - a.originalReleaseTime) <= twentyOneDaysMs
     );
 
     res.json({ results: freshResults });
@@ -3190,8 +3195,8 @@ app.post("/api/comments", requireAuth, async (req: AuthedRequest, res) => {
       const diary = ownerRow.sync_data && Array.isArray(ownerRow.sync_data.diary) ? ownerRow.sync_data.diary : [];
       const reviewEntry = diary.find((e: any) => e && e.id === reviewId);
       await pool!.query(
-        "insert into notifications (user_id, type, from_user_id, album_data, review_id) values ($1, 'comment', $2, $3, $4)",
-        [ownerRow.id, req.userId, reviewEntry && reviewEntry.album ? JSON.stringify(reviewEntry.album) : null, reviewId]
+        "insert into notifications (user_id, type, from_user_id, album_data, review_id, comment_id) values ($1, 'comment', $2, $3, $4, $5)",
+        [ownerRow.id, req.userId, reviewEntry && reviewEntry.album ? JSON.stringify(reviewEntry.album) : null, reviewId, insertResult.rows[0].id]
       );
       const albumName = reviewEntry && reviewEntry.album ? reviewEntry.album.name : "your review";
       pushToUser(ownerRow.id, "New Comment", `${commenter.username} commented on your review of ${albumName}: "${text.slice(0, 80)}"`).catch(() => {});
@@ -3259,7 +3264,7 @@ app.get("/api/notifications", requireAuth, async (req: AuthedRequest, res) => {
   }
   try {
     const result = await pool!.query(
-      `select n.id, n.type, n.is_read, n.created_at, n.album_data, n.review_id,
+      `select n.id, n.type, n.is_read, n.created_at, n.album_data, n.review_id, n.comment_id,
               u.email as from_email, u.username as from_username, u.avatar_url as from_avatar_url,
               exists(select 1 from follows where follower_id = $1 and followed_id = n.from_user_id) as already_following
        from notifications n
@@ -3277,6 +3282,7 @@ app.get("/api/notifications", requireAuth, async (req: AuthedRequest, res) => {
         createdAt: r.created_at,
         album: r.album_data || null,
         reviewId: r.review_id || null,
+        commentId: r.comment_id || null,
         alreadyFollowing: r.already_following,
         fromEmail: r.from_email,
         fromUsername: r.from_username,
