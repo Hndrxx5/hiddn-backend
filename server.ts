@@ -2270,13 +2270,70 @@ app.post("/api/sync-latest-drops", async (req, res) => {
 
 // 2. Fetch Album Tracks/Songs via iTunes API
 app.get("/api/album-tracks/:id", async (req, res) => {
-  const { id } = req.params;
-  if (!id) {
+  const rawId = req.params.id;
+  if (!rawId) {
     return res.status(400).json({ error: "Album ID is required" });
   }
 
+  // Search results for singles come back as "song-<id>" rather than a real
+  // album ID, since singles get filtered out of the album results entirely.
+  // Tapping one previously passed that literal prefixed string straight to
+  // iTunes as if it were an album ID, which produced garbage/unrelated
+  // results. Detect that case and resolve it to the song's actual parent
+  // album first.
+  const isSongId = rawId.startsWith("song-");
+  const cleanId = isSongId ? rawId.slice(5) : rawId;
+  const developerToken = process.env.APPLE_DEVELOPER_TOKEN;
+
   try {
-    const lookupUrl = `https://itunes.apple.com/lookup?id=${id}&entity=song`;
+    let albumId = cleanId;
+
+    if (isSongId && developerToken) {
+      // Resolve the song to its actual parent album via the real Apple
+      // Music API, which handles brand-new releases far more reliably
+      // than the legacy iTunes Lookup API.
+      const songUrl = `https://api.music.apple.com/v1/catalog/us/songs/${cleanId}?include=albums`;
+      const songRes = await fetch(songUrl, { headers: { Authorization: `Bearer ${developerToken}` } });
+      if (songRes.ok) {
+        const songData: any = await songRes.json();
+        const parentAlbumId = songData?.data?.[0]?.relationships?.albums?.data?.[0]?.id;
+        if (parentAlbumId) {
+          albumId = String(parentAlbumId);
+        }
+      } else {
+        console.warn(`[album-tracks] Could not resolve song ${cleanId} to a parent album — status ${songRes.status}`);
+      }
+    }
+
+    // Prefer the Apple Music API for the actual tracklist too, since it's
+    // more reliable for recent releases; fall back to iTunes only if no
+    // developer token is configured or the request fails.
+    if (developerToken) {
+      const albumUrl = `https://api.music.apple.com/v1/catalog/us/albums/${albumId}`;
+      const albumRes = await fetch(albumUrl, { headers: { Authorization: `Bearer ${developerToken}` } });
+      if (albumRes.ok) {
+        const albumData: any = await albumRes.json();
+        const tracks = albumData?.data?.[0]?.relationships?.tracks?.data || [];
+        const songs = tracks
+          .map((item: any) => {
+            const durationMs = item.attributes?.durationInMillis || 0;
+            const durationMin = Math.floor(durationMs / 60000);
+            const durationSec = Math.floor((durationMs % 60000) / 1000);
+            return {
+              title: item.attributes?.name || "Unknown Track",
+              duration: `${durationMin}:${durationSec.toString().padStart(2, "0")}`,
+              trackNumber: item.attributes?.trackNumber || 0,
+              previewUrl: item.attributes?.previews?.[0]?.url || null,
+            };
+          })
+          .sort((a: any, b: any) => a.trackNumber - b.trackNumber);
+        return res.json({ tracklist: songs });
+      }
+      console.warn(`[album-tracks] Apple Music API album lookup failed for ${albumId} — status ${albumRes.status}, falling back to iTunes.`);
+    }
+
+    // Fallback: legacy iTunes Lookup API
+    const lookupUrl = `https://itunes.apple.com/lookup?id=${albumId}&entity=song`;
     const response = await fetch(lookupUrl);
     if (!response.ok) {
       throw new Error(`iTunes lookup responded with status ${response.status}`);
@@ -2292,7 +2349,6 @@ app.get("/api/album-tracks/:id", async (req, res) => {
       }[];
     };
 
-    // Filter results to only song entries
     const songs = data.results
       .filter((item) => item.wrapperType === "track" && item.trackName)
       .map((item) => {
