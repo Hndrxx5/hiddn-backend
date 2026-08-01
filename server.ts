@@ -87,9 +87,22 @@ function getApnsJwt(): string | null {
     const payload = { iss: teamId, iat: now };
     const signingInput = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(payload))}`;
 
-    // Render env vars can't hold real newlines cleanly, so the key is stored
-    // with literal "\n" sequences that need converting back before use.
-    const normalizedKey = privateKey.replace(/\\n/g, "\n");
+    // Render env vars can't hold real newlines cleanly, so the key is
+    // normally stored with literal "\n" sequences that need converting
+    // back — but handle it defensively in case it was pasted with real
+    // newlines already, or picked up stray whitespace/hidden characters.
+    let normalizedKey = privateKey.trim();
+    if (normalizedKey.includes("\\n")) {
+      normalizedKey = normalizedKey.replace(/\\n/g, "\n");
+    }
+    // Guard against smart-quote or other invisible-character corruption
+    // sometimes introduced when pasting through certain browser fields.
+    normalizedKey = normalizedKey.replace(/\r\n/g, "\n").replace(/\u00A0/g, " ");
+
+    if (!normalizedKey.includes("-----BEGIN PRIVATE KEY-----") || !normalizedKey.includes("-----END PRIVATE KEY-----")) {
+      console.error("[PUSH] APNS_PRIVATE_KEY doesn't look like a valid PEM key after normalization — check it was pasted correctly into Render.");
+      return null;
+    }
 
     const signature = crypto.sign("sha256", Buffer.from(signingInput), {
       key: normalizedKey,
