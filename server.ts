@@ -101,12 +101,19 @@ async function sendPushNotification(deviceToken: string, title: string, body: st
   const jwtToken = getApnsJwt();
   const bundleId = process.env.APNS_BUNDLE_ID || "com.hiddencomplexity.hiddn";
   const apnsHost = process.env.APNS_HOST || "api.push.apple.com"; // use api.sandbox.push.apple.com while testing via Xcode/TestFlight if needed
-  if (!jwtToken) return false;
+  if (!jwtToken) {
+    console.error("[PUSH] No APNs JWT available — check APNS_TEAM_ID / APNS_KEY_ID / APNS_PRIVATE_KEY are all set on Render.");
+    return false;
+  }
+  console.log(`[PUSH] Sending to device token ${deviceToken.slice(0, 12)}... via ${apnsHost}, topic ${bundleId}`);
 
   return new Promise((resolve) => {
     try {
       const client = http2.connect(`https://${apnsHost}`);
-      client.on("error", () => resolve(false));
+      client.on("error", (err) => {
+        console.error("[PUSH] HTTP/2 connection error:", err.message);
+        resolve(false);
+      });
 
       const payload = JSON.stringify({
         aps: {
@@ -126,14 +133,25 @@ async function sendPushNotification(deviceToken: string, title: string, body: st
       });
 
       let status = 0;
+      let responseBody = "";
       req.on("response", (headers) => {
         status = Number(headers[":status"] || 0);
       });
+      req.on("data", (chunk) => {
+        responseBody += chunk.toString();
+      });
       req.on("end", () => {
         client.close();
-        resolve(status === 200);
+        if (status === 200) {
+          console.log("[PUSH] Sent successfully.");
+          resolve(true);
+        } else {
+          console.error(`[PUSH] APNs rejected the push — status ${status}, reason: ${responseBody}`);
+          resolve(false);
+        }
       });
-      req.on("error", () => {
+      req.on("error", (err) => {
+        console.error("[PUSH] Request error:", err.message);
         client.close();
         resolve(false);
       });
@@ -153,6 +171,7 @@ async function pushToUser(userId: string, title: string, body: string): Promise<
   if (!pool) return;
   try {
     const result = await pool.query("select device_token from device_tokens where user_id = $1", [userId]);
+    console.log(`[PUSH] User ${userId} has ${result.rows.length} registered device token(s).`);
     for (const row of result.rows) {
       sendPushNotification(row.device_token, title, body).catch(() => {});
     }
