@@ -3180,7 +3180,7 @@ app.post("/api/review-likes/toggle", requireAuth, async (req: AuthedRequest, res
         }
       }
 
-      if (ownerRow) {
+      if (ownerRow && ownerRow.id !== req.userId) {
         const diary = ownerRow.sync_data && Array.isArray(ownerRow.sync_data.diary) ? ownerRow.sync_data.diary : [];
         const reviewEntry = diary.find((e: any) => e && e.id === reviewId);
         await pool!.query(
@@ -3302,7 +3302,7 @@ app.post("/api/comments", requireAuth, async (req: AuthedRequest, res) => {
       }
     }
 
-    if (ownerRow) {
+    if (ownerRow && ownerRow.id !== req.userId) {
       const diary = ownerRow.sync_data && Array.isArray(ownerRow.sync_data.diary) ? ownerRow.sync_data.diary : [];
       const reviewEntry = diary.find((e: any) => e && e.id === reviewId);
       await pool!.query(
