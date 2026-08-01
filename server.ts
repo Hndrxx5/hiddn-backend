@@ -119,7 +119,7 @@ function getApnsJwt(): string | null {
   }
 }
 
-async function sendPushNotification(deviceToken: string, title: string, body: string, badge?: number): Promise<boolean> {
+async function sendPushNotification(deviceToken: string, title: string, body: string, navigationData?: Record<string, string>, badge?: number): Promise<boolean> {
   const jwtToken = getApnsJwt();
   const bundleId = process.env.APNS_BUNDLE_ID || "com.hiddencomplexity.hiddn";
   const apnsHost = process.env.APNS_HOST || "api.push.apple.com"; // use api.sandbox.push.apple.com while testing via Xcode/TestFlight if needed
@@ -143,6 +143,7 @@ async function sendPushNotification(deviceToken: string, title: string, body: st
           sound: "default",
           ...(badge !== undefined ? { badge } : {}),
         },
+        ...(navigationData || {}),
       });
 
       const req = client.request({
@@ -193,13 +194,13 @@ async function sendPushNotification(deviceToken: string, title: string, body: st
 // Sends a push to every device registered for this user. Best-effort —
 // failures (including no APNs credentials configured) are swallowed so a
 // push failure never breaks the actual action (follow/like/comment).
-async function pushToUser(userId: string, title: string, body: string): Promise<void> {
+async function pushToUser(userId: string, title: string, body: string, navigationData?: Record<string, string>): Promise<void> {
   if (!pool) return;
   try {
     const result = await pool.query("select device_token from device_tokens where user_id = $1", [userId]);
     console.log(`[PUSH] User ${userId} has ${result.rows.length} registered device token(s).`);
     for (const row of result.rows) {
-      sendPushNotification(row.device_token, title, body).catch((err) => {
+      sendPushNotification(row.device_token, title, body, navigationData).catch((err) => {
         console.error("[PUSH] sendPushNotification threw unexpectedly:", err);
       });
     }
@@ -2999,9 +3000,13 @@ app.post("/api/follow", requireAuth, async (req: AuthedRequest, res) => {
       "insert into notifications (user_id, type, from_user_id) values ($1, 'follow', $2)",
       [followedId, req.userId]
     );
-    const followerResult = await pool!.query("select username from users where id = $1", [req.userId]);
+    const followerResult = await pool!.query("select username, email from users where id = $1", [req.userId]);
     const followerName = followerResult.rows[0]?.username || "Someone";
-    pushToUser(followedId, "New Follower", `${followerName} started following you`).catch(() => {});
+    const followerEmail = followerResult.rows[0]?.email || "";
+    pushToUser(followedId, "New Follower", `${followerName} started following you`, {
+      type: "follow",
+      fromEmail: followerEmail,
+    }).catch(() => {});
     res.json({ success: true });
   } catch (error: any) {
     console.error("Follow error:", error);
@@ -3185,7 +3190,10 @@ app.post("/api/review-likes/toggle", requireAuth, async (req: AuthedRequest, res
         const likerResult = await pool!.query("select username from users where id = $1", [req.userId]);
         const likerName = likerResult.rows[0]?.username || "Someone";
         const albumName = reviewEntry && reviewEntry.album ? reviewEntry.album.name : "your review";
-        pushToUser(ownerRow.id, "New Like", `${likerName} liked your review of ${albumName}`).catch(() => {});
+        pushToUser(ownerRow.id, "New Like", `${likerName} liked your review of ${albumName}`, {
+          type: "like",
+          reviewId,
+        }).catch(() => {});
       }
     }
 
@@ -3281,7 +3289,11 @@ app.post("/api/comments", requireAuth, async (req: AuthedRequest, res) => {
         [ownerRow.id, req.userId, reviewEntry && reviewEntry.album ? JSON.stringify(reviewEntry.album) : null, reviewId, insertResult.rows[0].id]
       );
       const albumName = reviewEntry && reviewEntry.album ? reviewEntry.album.name : "your review";
-      pushToUser(ownerRow.id, "New Comment", `${commenter.username} commented on your review of ${albumName}: "${text.slice(0, 80)}"`).catch(() => {});
+      pushToUser(ownerRow.id, "New Comment", `${commenter.username} commented on your review of ${albumName}: "${text.slice(0, 80)}"`, {
+        type: "comment",
+        reviewId,
+        commentId: String(insertResult.rows[0].id),
+      }).catch(() => {});
     }
 
     res.json({
