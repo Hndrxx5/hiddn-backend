@@ -69,32 +69,41 @@ function base64url(input: Buffer | string): string {
 }
 
 function getApnsJwt(): string | null {
-  const teamId = process.env.APNS_TEAM_ID;
-  const keyId = process.env.APNS_KEY_ID;
-  const privateKey = process.env.APNS_PRIVATE_KEY;
-  if (!teamId || !keyId || !privateKey) return null;
+  try {
+    const teamId = process.env.APNS_TEAM_ID;
+    const keyId = process.env.APNS_KEY_ID;
+    const privateKey = process.env.APNS_PRIVATE_KEY;
+    if (!teamId || !keyId || !privateKey) {
+      console.error(`[PUSH] Missing APNs env vars — teamId:${!!teamId} keyId:${!!keyId} privateKey:${!!privateKey}`);
+      return null;
+    }
 
-  const now = Math.floor(Date.now() / 1000);
-  if (apnsJwtCache && now - apnsJwtCache.issuedAt < 60 * 15) {
-    return apnsJwtCache.token;
+    const now = Math.floor(Date.now() / 1000);
+    if (apnsJwtCache && now - apnsJwtCache.issuedAt < 60 * 15) {
+      return apnsJwtCache.token;
+    }
+
+    const header = { alg: "ES256", kid: keyId };
+    const payload = { iss: teamId, iat: now };
+    const signingInput = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(payload))}`;
+
+    // Render env vars can't hold real newlines cleanly, so the key is stored
+    // with literal "\n" sequences that need converting back before use.
+    const normalizedKey = privateKey.replace(/\\n/g, "\n");
+
+    const signature = crypto.sign("sha256", Buffer.from(signingInput), {
+      key: normalizedKey,
+      dsaEncoding: "ieee-p1363",
+    });
+
+    const token = `${signingInput}.${base64url(signature)}`;
+    apnsJwtCache = { token, issuedAt: now };
+    console.log("[PUSH] Generated fresh APNs JWT successfully.");
+    return token;
+  } catch (error: any) {
+    console.error("[PUSH] getApnsJwt() threw an exception:", error.message, error.stack);
+    return null;
   }
-
-  const header = { alg: "ES256", kid: keyId };
-  const payload = { iss: teamId, iat: now };
-  const signingInput = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(payload))}`;
-
-  // Render env vars can't hold real newlines cleanly, so the key is stored
-  // with literal "\n" sequences that need converting back before use.
-  const normalizedKey = privateKey.replace(/\\n/g, "\n");
-
-  const signature = crypto.sign("sha256", Buffer.from(signingInput), {
-    key: normalizedKey,
-    dsaEncoding: "ieee-p1363",
-  });
-
-  const token = `${signingInput}.${base64url(signature)}`;
-  apnsJwtCache = { token, issuedAt: now };
-  return token;
 }
 
 async function sendPushNotification(deviceToken: string, title: string, body: string, badge?: number): Promise<boolean> {
@@ -173,7 +182,9 @@ async function pushToUser(userId: string, title: string, body: string): Promise<
     const result = await pool.query("select device_token from device_tokens where user_id = $1", [userId]);
     console.log(`[PUSH] User ${userId} has ${result.rows.length} registered device token(s).`);
     for (const row of result.rows) {
-      sendPushNotification(row.device_token, title, body).catch(() => {});
+      sendPushNotification(row.device_token, title, body).catch((err) => {
+        console.error("[PUSH] sendPushNotification threw unexpectedly:", err);
+      });
     }
   } catch (error) {
     console.error("pushToUser error:", error);
