@@ -3123,12 +3123,31 @@ app.post("/api/review-likes/toggle", requireAuth, async (req: AuthedRequest, res
     const countResult = await pool!.query("select count(*) from review_likes where review_id = $1", [reviewId]);
 
     if (liked) {
-      const ownerResult = await pool!.query(
-        `select id, sync_data from users where sync_data->'diary' @> $1::jsonb and id != $2`,
-        [JSON.stringify([{ id: reviewId }]), req.userId]
-      );
-      if (ownerResult.rows.length > 0) {
-        const ownerRow = ownerResult.rows[0];
+      const providedOwnerEmail = String(req.body?.reviewOwnerEmail || "").trim().toLowerCase();
+      let ownerRow: any = null;
+
+      if (providedOwnerEmail) {
+        const directResult = await pool!.query(
+          "select id, sync_data from users where email = $1",
+          [providedOwnerEmail]
+        );
+        if (directResult.rows.length > 0) ownerRow = directResult.rows[0];
+        else console.error(`[LIKE] reviewOwnerEmail provided (${providedOwnerEmail}) but no matching user found.`);
+      }
+
+      if (!ownerRow) {
+        const ownerResult = await pool!.query(
+          `select id, sync_data from users where sync_data->'diary' @> $1::jsonb and id != $2`,
+          [JSON.stringify([{ id: reviewId }]), req.userId]
+        );
+        if (ownerResult.rows.length > 0) {
+          ownerRow = ownerResult.rows[0];
+        } else {
+          console.error(`[LIKE] Could not determine review owner for reviewId ${reviewId} via JSONB fallback search either — no notification will be created.`);
+        }
+      }
+
+      if (ownerRow) {
         const diary = ownerRow.sync_data && Array.isArray(ownerRow.sync_data.diary) ? ownerRow.sync_data.diary : [];
         const reviewEntry = diary.find((e: any) => e && e.id === reviewId);
         await pool!.query(
@@ -3205,12 +3224,28 @@ app.post("/api/comments", requireAuth, async (req: AuthedRequest, res) => {
     const commenterResult = await pool!.query("select email, username, avatar_url from users where id = $1", [req.userId]);
     const commenter = commenterResult.rows[0];
 
-    const ownerResult = await pool!.query(
-      `select id, sync_data from users where sync_data->'diary' @> $1::jsonb and id != $2`,
-      [JSON.stringify([{ id: reviewId }]), req.userId]
-    );
-    if (ownerResult.rows.length > 0) {
-      const ownerRow = ownerResult.rows[0];
+    const providedOwnerEmail = String(req.body?.reviewOwnerEmail || "").trim().toLowerCase();
+    let ownerRow: any = null;
+
+    if (providedOwnerEmail) {
+      const directResult = await pool!.query("select id, sync_data from users where email = $1", [providedOwnerEmail]);
+      if (directResult.rows.length > 0) ownerRow = directResult.rows[0];
+      else console.error(`[COMMENT] reviewOwnerEmail provided (${providedOwnerEmail}) but no matching user found.`);
+    }
+
+    if (!ownerRow) {
+      const ownerResult = await pool!.query(
+        `select id, sync_data from users where sync_data->'diary' @> $1::jsonb and id != $2`,
+        [JSON.stringify([{ id: reviewId }]), req.userId]
+      );
+      if (ownerResult.rows.length > 0) {
+        ownerRow = ownerResult.rows[0];
+      } else {
+        console.error(`[COMMENT] Could not determine review owner for reviewId ${reviewId} via JSONB fallback search either — no notification will be created.`);
+      }
+    }
+
+    if (ownerRow) {
       const diary = ownerRow.sync_data && Array.isArray(ownerRow.sync_data.diary) ? ownerRow.sync_data.diary : [];
       const reviewEntry = diary.find((e: any) => e && e.id === reviewId);
       await pool!.query(
