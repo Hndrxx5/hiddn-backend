@@ -169,6 +169,10 @@ async function sendPushNotification(deviceToken: string, title: string, body: st
           resolve(true);
         } else {
           console.error(`[PUSH] APNs rejected the push — status ${status}, reason: ${responseBody}`);
+          if (responseBody.includes("BadDeviceToken") || responseBody.includes("Unregistered")) {
+            console.log(`[PUSH] Removing stale/invalid device token from database: ${deviceToken.slice(0, 12)}...`);
+            pool?.query("delete from device_tokens where device_token = $1", [deviceToken]).catch(() => {});
+          }
           resolve(false);
         }
       });
