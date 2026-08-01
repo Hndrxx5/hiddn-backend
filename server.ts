@@ -3212,7 +3212,7 @@ app.get("/api/comments/:reviewId", requireAuth, async (req: AuthedRequest, res) 
   try {
     const reviewId = String(req.params.reviewId || "").trim();
     const result = await pool!.query(
-      `select c.id, c.text, c.created_at, c.user_id,
+      `select c.id, c.text, c.created_at, c.user_id, c.parent_comment_id,
               u.email, u.username, u.avatar_url
        from review_comments c join users u on u.id = c.user_id
        where c.review_id = $1
@@ -3220,12 +3220,32 @@ app.get("/api/comments/:reviewId", requireAuth, async (req: AuthedRequest, res) 
        limit 200`,
       [reviewId]
     );
+
+    const commentIds = result.rows.map((r: any) => r.id);
+    let likeCountMap = new Map<string, number>();
+    let likedSet = new Set<string>();
+    if (commentIds.length > 0) {
+      const likeCounts = await pool!.query(
+        "select comment_id, count(*) as count from comment_likes where comment_id = any($1) group by comment_id",
+        [commentIds]
+      );
+      likeCountMap = new Map(likeCounts.rows.map((r: any) => [r.comment_id, parseInt(r.count, 10)]));
+      const viewerLikes = await pool!.query(
+        "select comment_id from comment_likes where user_id = $1 and comment_id = any($2)",
+        [req.userId, commentIds]
+      );
+      likedSet = new Set(viewerLikes.rows.map((r: any) => r.comment_id));
+    }
+
     res.json({
       comments: result.rows.map((r: any) => ({
         id: r.id,
         text: r.text,
         createdAt: r.created_at,
         isOwn: r.user_id === req.userId,
+        parentCommentId: r.parent_comment_id || null,
+        likes: likeCountMap.get(r.id) || 0,
+        likedByUser: likedSet.has(r.id),
         user: {
           email: r.email,
           username: r.username,
@@ -3247,14 +3267,15 @@ app.post("/api/comments", requireAuth, async (req: AuthedRequest, res) => {
   try {
     const reviewId = String(req.body?.reviewId || "").trim();
     const text = String(req.body?.text || "").trim().slice(0, 1000);
+    const parentCommentId = req.body?.parentCommentId ? String(req.body.parentCommentId).trim() : null;
     if (!reviewId || !text) {
       res.status(400).json({ error: "reviewId and text are required." });
       return;
     }
 
     const insertResult = await pool!.query(
-      "insert into review_comments (user_id, review_id, text) values ($1, $2, $3) returning id, created_at",
-      [req.userId, reviewId, text]
+      "insert into review_comments (user_id, review_id, text, parent_comment_id) values ($1, $2, $3, $4) returning id, created_at",
+      [req.userId, reviewId, text, parentCommentId]
     );
 
     const commenterResult = await pool!.query("select email, username, avatar_url from users where id = $1", [req.userId]);
@@ -3296,12 +3317,41 @@ app.post("/api/comments", requireAuth, async (req: AuthedRequest, res) => {
       }).catch(() => {});
     }
 
+    // If this is a reply to a specific comment, separately notify that
+    // comment's author too — unless they're the same person as the review
+    // owner (already notified above) or replying to their own comment.
+    if (parentCommentId) {
+      const parentResult = await pool!.query(
+        "select user_id from review_comments where id = $1",
+        [parentCommentId]
+      );
+      if (parentResult.rows.length > 0) {
+        const parentAuthorId = parentResult.rows[0].user_id;
+        if (parentAuthorId !== req.userId && (!ownerRow || parentAuthorId !== ownerRow.id)) {
+          const diary = ownerRow && ownerRow.sync_data && Array.isArray(ownerRow.sync_data.diary) ? ownerRow.sync_data.diary : [];
+          const reviewEntry = diary.find((e: any) => e && e.id === reviewId);
+          await pool!.query(
+            "insert into notifications (user_id, type, from_user_id, album_data, review_id, comment_id) values ($1, 'reply', $2, $3, $4, $5)",
+            [parentAuthorId, req.userId, reviewEntry && reviewEntry.album ? JSON.stringify(reviewEntry.album) : null, reviewId, insertResult.rows[0].id]
+          );
+          pushToUser(parentAuthorId, "New Reply", `${commenter.username} replied to your comment: "${text.slice(0, 80)}"`, {
+            type: "reply",
+            reviewId,
+            commentId: String(insertResult.rows[0].id),
+          }).catch(() => {});
+        }
+      }
+    }
+
     res.json({
       comment: {
         id: insertResult.rows[0].id,
         text,
         createdAt: insertResult.rows[0].created_at,
         isOwn: true,
+        parentCommentId,
+        likes: 0,
+        likedByUser: false,
         user: {
           email: commenter.email,
           username: commenter.username,
@@ -3326,6 +3376,68 @@ app.delete("/api/comments/:id", requireAuth, async (req: AuthedRequest, res) => 
   } catch (error: any) {
     console.error("Delete comment error:", error);
     res.status(500).json({ error: "Failed to delete comment", details: error.message });
+  }
+});
+
+app.post("/api/comment-likes/toggle", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const commentId = String(req.body?.commentId || "").trim();
+    if (!commentId) {
+      res.status(400).json({ error: "commentId is required." });
+      return;
+    }
+
+    const existing = await pool!.query(
+      "select 1 from comment_likes where user_id = $1 and comment_id = $2",
+      [req.userId, commentId]
+    );
+
+    let liked: boolean;
+    if (existing.rows.length > 0) {
+      await pool!.query("delete from comment_likes where user_id = $1 and comment_id = $2", [req.userId, commentId]);
+      liked = false;
+    } else {
+      await pool!.query(
+        "insert into comment_likes (user_id, comment_id) values ($1, $2) on conflict do nothing",
+        [req.userId, commentId]
+      );
+      liked = true;
+    }
+
+    const countResult = await pool!.query("select count(*) from comment_likes where comment_id = $1", [commentId]);
+
+    if (liked) {
+      const commentResult = await pool!.query(
+        "select user_id, review_id from review_comments where id = $1",
+        [commentId]
+      );
+      if (commentResult.rows.length > 0) {
+        const commentAuthorId = commentResult.rows[0].user_id;
+        const commentReviewId = commentResult.rows[0].review_id;
+        if (commentAuthorId !== req.userId) {
+          const likerResult = await pool!.query("select username from users where id = $1", [req.userId]);
+          const likerName = likerResult.rows[0]?.username || "Someone";
+          await pool!.query(
+            "insert into notifications (user_id, type, from_user_id, review_id, comment_id) values ($1, 'comment_like', $2, $3, $4)",
+            [commentAuthorId, req.userId, commentReviewId, commentId]
+          );
+          pushToUser(commentAuthorId, "New Like", `${likerName} liked your comment`, {
+            type: "comment_like",
+            reviewId: commentReviewId,
+            commentId,
+          }).catch(() => {});
+        }
+      }
+    }
+
+    res.json({ liked, likes: parseInt(countResult.rows[0].count, 10) });
+  } catch (error: any) {
+    console.error("Toggle comment like error:", error);
+    res.status(500).json({ error: "Failed to update comment like", details: error.message });
   }
 });
 
