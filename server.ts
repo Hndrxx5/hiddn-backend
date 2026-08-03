@@ -3875,6 +3875,41 @@ app.get("/api/search-users", requireAuth, async (req: AuthedRequest, res) => {
 
 
 
+app.get("/api/discover-users", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const result = await pool!.query(
+      `select u.id, u.email, u.username, u.bio, u.avatar_url, u.sync_data, u.created_at
+       from users u
+       where u.id != $1
+         and not exists (
+           select 1 from follows f where f.follower_id = $1 and f.followed_id = u.id
+         )
+       order by u.created_at desc
+       limit 50`,
+      [req.userId]
+    );
+    res.json({
+      users: result.rows.map((r: any) => ({
+        id: r.email,
+        email: r.email,
+        username: r.username,
+        name: r.username,
+        bio: r.bio || "",
+        avatarUrl: r.avatar_url || generateDefaultAvatar(r.email),
+        favorites: (r.sync_data && Array.isArray(r.sync_data.favorites)) ? r.sync_data.favorites : [],
+        isFollowing: false,
+      })),
+    });
+  } catch (error: any) {
+    console.error("Discover users error:", error);
+    res.status(500).json({ error: "Failed to load users to discover", details: error.message });
+  }
+});
+
 app.post("/api/forgot-password", authRateLimiter, async (req, res) => {
   if (!accountsAvailable()) {
     res.status(503).json({ error: "Accounts are not configured on this server yet." });
