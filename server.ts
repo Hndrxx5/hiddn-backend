@@ -1963,30 +1963,15 @@ async function syncLatestDrops() {
       console.warn(`iTunes RSS v1 Top Albums failed for ${genreName}:`, err);
     }
 
-    // Unified simulation pass using a SINGLE global newest release date across ALL fetched albums
-    // This preserves the exact real-world relative release spacing (e.g. if one album is released 1 day before another, that 1-day spacing is perfectly maintained)
-    let globalNewestTime = 0;
-    for (const album of fetchedAlbums) {
-      if (album.originalReleaseTime > globalNewestTime) {
-        globalNewestTime = album.originalReleaseTime;
-      }
-    }
-    if (globalNewestTime === 0) {
-      globalNewestTime = now.getTime();
-    }
-
-    fetchedAlbums.forEach((album) => {
-      const diffMs = globalNewestTime - album.originalReleaseTime;
-      const diffDays = diffMs / (1000 * 60 * 60 * 24);
-
-      // Map the live feed release date to the simulated timeline relative to globalNewestTime
-      const simulatedTime = now.getTime() - (diffDays * 24 * 60 * 60 * 1000);
-      const simulatedDateObj = new Date(simulatedTime);
-      const simulatedDateStr = `${simulatedDateObj.getFullYear()}-${String(simulatedDateObj.getMonth() + 1).padStart(2, '0')}-${String(simulatedDateObj.getDate()).padStart(2, '0')}`;
-
-      album.releaseDate = simulatedDateStr;
-      album.originalReleaseTime = simulatedTime;
-    });
+    // NOTE: A "simulation" pass used to run here that rewrote every album's
+    // release date relative to whatever was newest in each sync batch. That
+    // meant even albums with a real, accurate release date from Apple's own
+    // API got silently overwritten and re-anchored to "now" on every single
+    // 24-hour sync — which is why dates never genuinely aged and albums
+    // could show "Just dropped" indefinitely. Removed entirely; every album
+    // already carries its own real originalReleaseTime from wherever it was
+    // actually fetched (Apple Music API or the RSS fallback), and that's
+    // exactly what should be trusted and left untouched here.
 
     // Fail-Safe Date Truncation & Classic Album Filtering
     const freshFetchedAlbums = fetchedAlbums.filter((album) => {
