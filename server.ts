@@ -2205,9 +2205,25 @@ app.get("/api/latest-drops", async (req, res) => {
     const rawResults = latestDropsCache[cacheKey] || [];
     const nowMs = Date.now();
     const twentyOneDaysMs = 21 * 24 * 60 * 60 * 1000;
-    const freshResults = rawResults.filter((a: any) =>
-      typeof a.originalReleaseTime === "number" && (nowMs - a.originalReleaseTime) <= twentyOneDaysMs
-    );
+    const freshResults = rawResults
+      .filter((a: any) =>
+        typeof a.originalReleaseTime === "number" && (nowMs - a.originalReleaseTime) <= twentyOneDaysMs
+      )
+      .map((a: any) => {
+        // The timeAgo label itself was computed at sync time (up to 24h
+        // stale) and cached as-is — recompute it fresh here every time,
+        // same as the freshness filter above already does, so "Just
+        // dropped" doesn't silently stay true for days after it stopped
+        // being accurate.
+        if (typeof a.originalReleaseTime !== "number") return a;
+        const diffDays = Math.floor((nowMs - a.originalReleaseTime) / (1000 * 60 * 60 * 24));
+        let timeAgo = "This Week";
+        if (diffDays <= 0) timeAgo = "Just dropped";
+        else if (diffDays === 1) timeAgo = "Yesterday";
+        else if (diffDays <= 7) timeAgo = `${diffDays} days ago`;
+        else timeAgo = `${Math.floor(diffDays / 7)} weeks ago`;
+        return { ...a, timeAgo };
+      });
 
     res.json({ results: freshResults });
   } catch (error: any) {
