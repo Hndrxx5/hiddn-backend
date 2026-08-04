@@ -3733,6 +3733,7 @@ app.get("/api/users/:email", requireAuth, async (req: AuthedRequest, res) => {
         followingCount: parseInt(followingCountResult.rows[0].count, 10),
         isFollowing: isFollowingResult.rows.length > 0,
         reviews: (row.sync_data && Array.isArray(row.sync_data.diary)) ? row.sync_data.diary : [],
+        collections: (row.sync_data && Array.isArray(row.sync_data.collections)) ? row.sync_data.collections : [],
       },
     });
   } catch (error: any) {
