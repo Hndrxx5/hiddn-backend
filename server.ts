@@ -1699,6 +1699,7 @@ async function fetchEstablishedArtistNewReleases(): Promise<any[]> {
       ) sub
       where artist is not null and artist != ''
       group by artist
+      having count(*) >= 3
       order by review_count desc
       limit 40
     `);
