@@ -3824,6 +3824,23 @@ app.post("/api/notifications/read-all", requireAuth, async (req: AuthedRequest, 
   }
 });
 
+app.delete("/api/notifications/:id", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    await pool!.query(
+      "delete from notifications where id = $1 and user_id = $2",
+      [req.params.id, req.userId]
+    );
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error("Delete notification error:", error);
+    res.status(500).json({ error: "Failed to delete notification", details: error.message });
+  }
+});
+
 
 app.post("/api/unfollow", requireAuth, async (req: AuthedRequest, res) => {
   if (!accountsAvailable()) {
@@ -4468,6 +4485,21 @@ async function startServer() {
     }).catch((err) => {
       console.error("Initial backend sync failed:", err);
     });
+
+    // Old notifications shouldn't pile up forever — clean up anything past
+    // 30 days, once on startup and then once daily going forward.
+    const cleanupOldNotifications = async () => {
+      try {
+        const result = await pool!.query(
+          "delete from notifications where created_at < now() - interval '30 days'"
+        );
+        console.log(`[SCHEDULER] Cleaned up ${result.rowCount} notifications older than 30 days.`);
+      } catch (err: any) {
+        console.error("[SCHEDULER] Notification cleanup failed:", err.message);
+      }
+    };
+    cleanupOldNotifications();
+    setInterval(cleanupOldNotifications, 24 * 60 * 60 * 1000);
 
     // Schedule automatic music sync every 3 hours
     setInterval(async () => {
