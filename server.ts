@@ -1836,7 +1836,7 @@ async function syncLatestDrops() {
     try {
       const token = process.env.APPLE_DEVELOPER_TOKEN || process.env.APPLE_MUSIC_JWT;
       if (token) {
-        const url = `https://api.music.apple.com/v1/catalog/us/charts?types=albums${genreId ? `&genre=${genreId}` : ""}&chart=new-releases&limit=100`;
+        const url = `https://api.music.apple.com/v1/catalog/us/charts?types=albums${genreId ? `&genre=${genreId}` : ""}&chart=new-releases&limit=30`;
         const res = await fetch(url, {
           headers: { "Authorization": `Bearer ${token}` }
         });
