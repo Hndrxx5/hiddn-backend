@@ -1014,6 +1014,10 @@ app.get("/api/live-new-drops", async (req, res) => {
 
 // Active in-memory store/cache for daily drops matching WIPE-BEFORE-WRITE requirement
 const latestDropsCache: Record<string, any[]> = {};
+// Caches whether an artist has an established discography (3+ albums),
+// keyed by artist name — persists across sync cycles since many artists
+// repeat, avoiding redundant API calls to check the same artist repeatedly.
+const artistEstablishedCache: Record<string, boolean> = {};
 const popularReleasesCache: Record<string, any[]> = {};
 
 // Curated real-world high-profile releases matching Apple Music "New This Week" tab
@@ -1685,6 +1689,51 @@ async function syncPopularReleases() {
 // as the actual quality filter, so this can't be used to surface a brand
 // new, unproven upload — only an established artist's new drop that simply
 // hasn't caught up to the chart yet.
+// Checks whether an artist has an established discography (3+ albums) via
+// Apple Music, caching the result since the same artists tend to repeat
+// across sync cycles and even across genres. This is the actual, direct
+// quality filter — used both for the established-artist supplement and,
+// now, for the base chart results themselves, since Apple's own chart
+// isn't reliably popular-only for smaller/less active genres.
+async function isArtistEstablished(artistName: string, token: string): Promise<boolean> {
+  if (artistName in artistEstablishedCache) {
+    return artistEstablishedCache[artistName];
+  }
+  try {
+    const searchUrl = `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(artistName)}&types=artists&limit=1`;
+    const searchRes = await fetch(searchUrl, { headers: { Authorization: `Bearer ${token}` } });
+    if (!searchRes.ok) {
+      artistEstablishedCache[artistName] = false;
+      return false;
+    }
+    const searchJson: any = await searchRes.json();
+    const artistId = searchJson?.results?.artists?.data?.[0]?.id;
+    if (!artistId) {
+      artistEstablishedCache[artistName] = false;
+      return false;
+    }
+    const albumsUrl = `https://api.music.apple.com/v1/catalog/us/artists/${artistId}/albums?limit=5`;
+    const albumsRes = await fetch(albumsUrl, { headers: { Authorization: `Bearer ${token}` } });
+    if (!albumsRes.ok) {
+      artistEstablishedCache[artistName] = false;
+      return false;
+    }
+    const albumsJson: any = await albumsRes.json();
+    const albumCount = (albumsJson?.data || []).length;
+    // limit=5 means this only distinguishes "0-4" from "5", but combined
+    // with the meta.total field when present, or just this count, 3+ is
+    // still a meaningful signal — an artist with fewer than 3 total
+    // catalog entries is very unlikely to be genuinely established.
+    const total = albumsJson?.meta?.total;
+    const established = typeof total === "number" ? total >= 3 : albumCount >= 3;
+    artistEstablishedCache[artistName] = established;
+    return established;
+  } catch {
+    artistEstablishedCache[artistName] = false;
+    return false;
+  }
+}
+
 async function fetchEstablishedArtistNewReleases(): Promise<any[]> {
   const token = process.env.APPLE_DEVELOPER_TOKEN || process.env.APPLE_MUSIC_JWT;
   if (!token || !pool) return [];
@@ -1874,6 +1923,13 @@ async function syncLatestDrops() {
             const artist = attributes.artistName || "Unknown Artist";
             const key = getAlbumKey(name, artist);
             if (seenIds.has(id) || seenKeys.has(key)) continue;
+
+            // The actual, direct quality filter — same 3+ albums standard
+            // used for the supplement, now applied to the chart itself too,
+            // since the chart alone wasn't reliably excluding self-uploaded
+            // content for smaller/less active genres.
+            const established = await isArtistEstablished(artist, token);
+            if (!established) continue;
 
             fetchedAlbums.push({
               id,
@@ -2273,6 +2329,9 @@ async function syncLatestDrops() {
               if (isNaN(releaseTime) || nowMs - releaseTime > sixtyDaysMs || releaseTime > nowMs) continue;
               const trackCount = attrs.trackCount || 0;
               if (trackCount <= 1) continue; // still exclude singles here too
+              const fallbackArtist = attrs.artistName || "Unknown Artist";
+              const fallbackEstablished = await isArtistEstablished(fallbackArtist, fallbackToken);
+              if (!fallbackEstablished) continue;
               const rawArtwork = attrs.artwork?.url || "";
               processedAlbums.push({
                 id: String(album.id),
