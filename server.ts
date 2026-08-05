@@ -2393,7 +2393,13 @@ app.get("/api/artists/:id", async (req, res) => {
       // Fetch Artist and Albums in parallel — track count on each album
       // entry is what actually distinguishes singles from full albums.
       const artistUrl = `https://api.music.apple.com/v1/catalog/${storefront}/artists/${cleanId}`;
-      const albumsUrl = `https://api.music.apple.com/v1/catalog/${storefront}/artists/${cleanId}/albums?limit=50`;
+            // Apple's own API does NOT sort this relationship by release date by
+      // default — the order is effectively arbitrary. Without an explicit
+      // sort, a prolific artist's newest release can easily fall outside
+      // the first 50 results and appear "missing" even though it exists in
+      // the catalog right now. This sort parameter is undocumented but
+      // confirmed working through community testing.
+      const albumsUrl = `https://api.music.apple.com/v1/catalog/${storefront}/artists/${cleanId}/albums?limit=50&sort=-releaseDate`;
 
       const [artistRes, albumsRes] = await Promise.all([
         fetch(artistUrl, { headers: { "Authorization": `Bearer ${developerToken}` } }),
