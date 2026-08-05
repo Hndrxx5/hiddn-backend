@@ -2251,6 +2251,53 @@ async function syncLatestDrops() {
     }
     processedAlbums.sort((a, b) => b.originalReleaseTime - a.originalReleaseTime);
 
+    // Never-empty fallback: if this genre genuinely has zero qualifying
+    // releases even after the supplement, widen the window and re-check
+    // the same trusted Apple chart source — never fall back to anything
+    // unfiltered, just look further back in time from the same place.
+    if (processedAlbums.length === 0) {
+      const fallbackToken = process.env.APPLE_DEVELOPER_TOKEN || process.env.APPLE_MUSIC_JWT;
+      if (fallbackToken) {
+        try {
+          const wideUrl = `https://api.music.apple.com/v1/catalog/us/charts?types=albums${genreId ? `&genre=${genreId}` : ""}&chart=new-releases&limit=30`;
+          const wideRes = await fetch(wideUrl, { headers: { Authorization: `Bearer ${fallbackToken}` } });
+          if (wideRes.ok) {
+            const wideJson: any = await wideRes.json();
+            const wideAlbumsData = wideJson?.results?.albums?.[0]?.data || [];
+            const nowMs = now.getTime();
+            const sixtyDaysMs = 60 * 24 * 60 * 60 * 1000;
+            for (const album of wideAlbumsData) {
+              const attrs = album.attributes;
+              if (!attrs?.releaseDate) continue;
+              const releaseTime = new Date(attrs.releaseDate).getTime();
+              if (isNaN(releaseTime) || nowMs - releaseTime > sixtyDaysMs || releaseTime > nowMs) continue;
+              const trackCount = attrs.trackCount || 0;
+              if (trackCount <= 1) continue; // still exclude singles here too
+              const rawArtwork = attrs.artwork?.url || "";
+              processedAlbums.push({
+                id: String(album.id),
+                name: attrs.name || "Unknown",
+                artist: attrs.artistName || "Unknown Artist",
+                coverUrl: rawArtwork.replace("{w}", "600").replace("{h}", "600"),
+                genres: attrs.genreNames || [],
+                releaseDate: attrs.releaseDate,
+                timeAgo: "",
+                averageRating: 0,
+                reviewCount: 0,
+                originalReleaseTime: releaseTime,
+              });
+            }
+            if (processedAlbums.length > 0) {
+              console.log(` -> FALLBACK: Genre '${genreName}' had no releases in the normal window, widened to 60 days and found ${processedAlbums.length}.`);
+            }
+          }
+        } catch (fallbackErr: any) {
+          console.error(` -> FALLBACK failed for genre '${genreName}':`, fallbackErr.message);
+        }
+        processedAlbums.sort((a, b) => b.originalReleaseTime - a.originalReleaseTime);
+      }
+    }
+
     latestDropsCache[cacheKey] = processedAlbums.slice(0, 16);
     console.log(` -> SUCCESS: Saved ${latestDropsCache[cacheKey].length} pristine releases for genre '${genreName}'`);
   }
