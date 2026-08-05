@@ -1678,6 +1678,86 @@ async function syncPopularReleases() {
 }
 
 // Automated robust database sync routine following strict catalog mapping, recency and artwork rules
+// Supplements the curated Apple Music chart with brand-new releases from
+// artists that Hiddn's own users have actually reviewed — a real signal of
+// who matters to this specific audience, rather than a generic popularity
+// guess. Requires each artist to already have 3+ albums in Apple's catalog
+// as the actual quality filter, so this can't be used to surface a brand
+// new, unproven upload — only an established artist's new drop that simply
+// hasn't caught up to the chart yet.
+async function fetchEstablishedArtistNewReleases(): Promise<any[]> {
+  const token = process.env.APPLE_DEVELOPER_TOKEN || process.env.APPLE_MUSIC_JWT;
+  if (!token || !pool) return [];
+
+  try {
+    const result = await pool.query(`
+      select artist, count(*) as review_count
+      from (
+        select jsonb_array_elements(sync_data->'diary')->'album'->>'artist' as artist
+        from users
+        where sync_data->'diary' is not null
+      ) sub
+      where artist is not null and artist != ''
+      group by artist
+      order by review_count desc
+      limit 40
+    `);
+
+    const topArtists: string[] = result.rows.map((r: any) => r.artist).filter(Boolean);
+    const nowMs = Date.now();
+    const twentyOneDaysMs = 21 * 24 * 60 * 60 * 1000;
+    const supplementalReleases: any[] = [];
+
+    for (const artistName of topArtists) {
+      try {
+        const searchUrl = `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(artistName)}&types=artists&limit=1`;
+        const searchRes = await fetch(searchUrl, { headers: { Authorization: `Bearer ${token}` } });
+        if (!searchRes.ok) continue;
+        const searchJson: any = await searchRes.json();
+        const artistId = searchJson?.results?.artists?.data?.[0]?.id;
+        if (!artistId) continue;
+
+        const albumsUrl = `https://api.music.apple.com/v1/catalog/us/artists/${artistId}/albums?limit=10&sort=-releaseDate`;
+        const albumsRes = await fetch(albumsUrl, { headers: { Authorization: `Bearer ${token}` } });
+        if (!albumsRes.ok) continue;
+        const albumsJson: any = await albumsRes.json();
+        const albums = albumsJson?.data || [];
+
+        // The actual quality filter: only established artists, not brand
+        // new/unproven uploads.
+        if (albums.length < 3) continue;
+
+        const newest = albums[0];
+        const releaseDateStr = newest?.attributes?.releaseDate;
+        if (!releaseDateStr) continue;
+        const releaseTime = new Date(releaseDateStr).getTime();
+        if (isNaN(releaseTime) || nowMs - releaseTime > twentyOneDaysMs || releaseTime > nowMs) continue;
+
+        const rawArtwork = newest.attributes?.artwork?.url || "";
+        const coverUrl = rawArtwork.replace("{w}", "600").replace("{h}", "600");
+
+        supplementalReleases.push({
+          id: String(newest.id),
+          name: newest.attributes?.name || "Unknown",
+          artist: artistName,
+          coverUrl,
+          genres: newest.attributes?.genreNames || [],
+          releaseDate: releaseDateStr,
+          originalReleaseTime: releaseTime,
+        });
+      } catch {
+        continue; // one artist failing shouldn't break the whole supplement
+      }
+    }
+
+    console.log(`[Latest Drops supplement] Found ${supplementalReleases.length} fresh releases from established, user-reviewed artists.`);
+    return supplementalReleases;
+  } catch (error: any) {
+    console.error("[Latest Drops supplement] Failed:", error.message);
+    return [];
+  }
+}
+
 async function syncLatestDrops() {
   console.log("\n===================================================================");
   console.log("💿 RUNNING AUTOMATED BACKEND MUSIC DATA SYNC & CLEANUP ROUTINE 💿");
@@ -1685,6 +1765,11 @@ async function syncLatestDrops() {
 
   // Use the actual current date to ensure that new drops are correctly processed relative to today
   const now = new Date();
+
+  // Computed once, reused across every genre below — this is the "brand
+  // new release from an established, user-relevant artist" safety net,
+  // supplementing Apple's own chart rather than replacing it.
+  const establishedArtistReleases = await fetchEstablishedArtistNewReleases();
 
   const targetSyncGenres = [
     { id: "21", name: "Rock", cacheKey: "rock" },
@@ -1750,7 +1835,7 @@ async function syncLatestDrops() {
     try {
       const token = process.env.APPLE_DEVELOPER_TOKEN || process.env.APPLE_MUSIC_JWT;
       if (token) {
-        const url = `https://api.music.apple.com/v1/catalog/us/charts?types=albums${genreId ? `&genre=${genreId}` : ""}&chart=new-releases&limit=30`;
+        const url = `https://api.music.apple.com/v1/catalog/us/charts?types=albums${genreId ? `&genre=${genreId}` : ""}&chart=new-releases&limit=100`;
         const res = await fetch(url, {
           headers: { "Authorization": `Bearer ${token}` }
         });
@@ -2146,6 +2231,25 @@ async function syncLatestDrops() {
     latestDropsCache[cacheKey] = [];
 
     // Save strictly filtered releases
+    // Merge in the established-artist supplement for this specific genre —
+    // matched by whether Apple's own genre tags for that release include
+    // this genre's name, or if we're building the "All Genres" bucket.
+    const matchingSupplement = establishedArtistReleases.filter((rel: any) => {
+      if (genreName === "All Genres") return true;
+      const relGenres: string[] = (rel.genres || []).map((g: string) => g.toLowerCase());
+      const target = genreName.toLowerCase();
+      return relGenres.some((g) => g.includes(target) || target.includes(g));
+    });
+    for (const supplement of matchingSupplement) {
+      const alreadyPresent = processedAlbums.some(
+        (a) => a.id === supplement.id || getAlbumKey(a.name, a.artist) === getAlbumKey(supplement.name, supplement.artist)
+      );
+      if (!alreadyPresent) {
+        processedAlbums.push(supplement);
+      }
+    }
+    processedAlbums.sort((a, b) => b.originalReleaseTime - a.originalReleaseTime);
+
     latestDropsCache[cacheKey] = processedAlbums.slice(0, 16);
     console.log(` -> SUCCESS: Saved ${latestDropsCache[cacheKey].length} pristine releases for genre '${genreName}'`);
   }
