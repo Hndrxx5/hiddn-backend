@@ -4340,17 +4340,17 @@ async function startServer() {
       console.error("Initial backend sync failed:", err);
     });
 
-    // Schedule automatic music sync every 24 hours
+    // Schedule automatic music sync every 3 hours
     setInterval(async () => {
-      console.log("[SCHEDULER] Starting scheduled 24-hour periodic music data sync...");
+      console.log("[SCHEDULER] Starting scheduled 3-hour periodic music data sync...");
       try {
         await syncPopularReleases();
         await syncLatestDrops();
-        console.log("[SCHEDULER] Scheduled 24-hour music data sync completed successfully.");
+        console.log("[SCHEDULER] Scheduled 3-hour music data sync completed successfully.");
       } catch (err) {
-        console.error("[SCHEDULER] Scheduled 24-hour music data sync failed:", err);
+        console.error("[SCHEDULER] Scheduled 3-hour music data sync failed:", err);
       }
-    }, 24 * 60 * 60 * 1000);
+    }, 3 * 60 * 60 * 1000);
   });
 }
 
