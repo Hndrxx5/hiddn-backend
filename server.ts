@@ -1893,6 +1893,7 @@ async function syncLatestDrops() {
           realApiSucceeded = true;
           const json = await res.json();
           const albumsData = json?.results?.albums?.[0]?.data || [];
+          const candidates: any[] = [];
           for (const item of albumsData) {
             const attributes = item?.attributes;
             if (!attributes) continue;
@@ -1924,24 +1925,31 @@ async function syncLatestDrops() {
             const key = getAlbumKey(name, artist);
             if (seenIds.has(id) || seenKeys.has(key)) continue;
 
-            // The actual, direct quality filter — same 3+ albums standard
-            // used for the supplement, now applied to the chart itself too,
-            // since the chart alone wasn't reliably excluding self-uploaded
-            // content for smaller/less active genres.
-            const established = await isArtistEstablished(artist, token);
-            if (!established) continue;
-
-            fetchedAlbums.push({
-              id,
-              name,
-              artist,
-              coverUrl,
-              genres: attributes.genreNames || [genreName],
-              releaseDate: releaseDateStr,
-              originalReleaseTime: releaseDateObj.getTime()
-            });
+            candidates.push({ id, name, artist, coverUrl, genres: attributes.genreNames || [genreName], releaseDateStr, originalReleaseTime: releaseDateObj.getTime() });
             seenIds.add(id);
             seenKeys.add(key);
+          }
+
+          // Check all candidate artists in parallel rather than one at a
+          // time — sequential checks here could take long enough to risk
+          // timing out and silently falling back to an older, unfiltered
+          // data source, which would defeat the filter entirely.
+          const establishedResults = await Promise.all(
+            candidates.map((c) => isArtistEstablished(c.artist, token))
+          );
+
+          for (let i = 0; i < candidates.length; i++) {
+            if (!establishedResults[i]) continue;
+            const c = candidates[i];
+            fetchedAlbums.push({
+              id: c.id,
+              name: c.name,
+              artist: c.artist,
+              coverUrl: c.coverUrl,
+              genres: c.genres,
+              releaseDate: c.releaseDateStr,
+              originalReleaseTime: c.originalReleaseTime
+            });
           }
         }
       }
