@@ -4448,10 +4448,15 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
+    // Hiddn's actual interface is bundled inside the iOS app itself via a
+    // custom hiddn:// scheme — this backend never serves a web frontend at
+    // all, so there's no dist/index.html to send. The old catch-all route
+    // here was firing on every unmatched request (bot traffic, health
+    // checks, anything) and failing every single time trying to serve a
+    // file that doesn't exist, which flooded the logs and buried every
+    // other genuinely useful log line underneath it.
+    app.use((req, res) => {
+      res.status(404).json({ error: "Not found" });
     });
   }
 
