@@ -1703,18 +1703,21 @@ async function isArtistEstablished(artistName: string, token: string): Promise<b
     const searchUrl = `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(artistName)}&types=artists&limit=1`;
     const searchRes = await fetch(searchUrl, { headers: { Authorization: `Bearer ${token}` } });
     if (!searchRes.ok) {
+      console.error(`[isArtistEstablished] "${artistName}": artist search failed, status ${searchRes.status}`);
       artistEstablishedCache[artistName] = false;
       return false;
     }
     const searchJson: any = await searchRes.json();
     const artistId = searchJson?.results?.artists?.data?.[0]?.id;
     if (!artistId) {
+      console.error(`[isArtistEstablished] "${artistName}": no artist match found in search results.`);
       artistEstablishedCache[artistName] = false;
       return false;
     }
     const albumsUrl = `https://api.music.apple.com/v1/catalog/us/artists/${artistId}/albums?limit=5`;
     const albumsRes = await fetch(albumsUrl, { headers: { Authorization: `Bearer ${token}` } });
     if (!albumsRes.ok) {
+      console.error(`[isArtistEstablished] "${artistName}" (id ${artistId}): albums lookup failed, status ${albumsRes.status}`);
       artistEstablishedCache[artistName] = false;
       return false;
     }
@@ -1726,9 +1729,11 @@ async function isArtistEstablished(artistName: string, token: string): Promise<b
     // catalog entries is very unlikely to be genuinely established.
     const total = albumsJson?.meta?.total;
     const established = typeof total === "number" ? total >= 3 : albumCount >= 3;
+    console.log(`[isArtistEstablished] "${artistName}" (id ${artistId}): meta.total=${total}, returned albumCount=${albumCount} -> established=${established}`);
     artistEstablishedCache[artistName] = established;
     return established;
-  } catch {
+  } catch (err: any) {
+    console.error(`[isArtistEstablished] "${artistName}": threw an exception:`, err.message);
     artistEstablishedCache[artistName] = false;
     return false;
   }
@@ -1934,9 +1939,13 @@ async function syncLatestDrops() {
           // time — sequential checks here could take long enough to risk
           // timing out and silently falling back to an older, unfiltered
           // data source, which would defeat the filter entirely.
+          console.log(`[Chart Filter] ${genreName}: ${candidates.length} candidates from Apple's chart before established-artist check.`);
           const establishedResults = await Promise.all(
             candidates.map((c) => isArtistEstablished(c.artist, token))
           );
+          for (let i = 0; i < candidates.length; i++) {
+            console.log(`[Chart Filter] ${genreName}: "${candidates[i].artist}" -> established=${establishedResults[i]}`);
+          }
 
           for (let i = 0; i < candidates.length; i++) {
             if (!establishedResults[i]) continue;
@@ -1951,6 +1960,7 @@ async function syncLatestDrops() {
               originalReleaseTime: c.originalReleaseTime
             });
           }
+          console.log(`[Chart Filter] ${genreName}: ${fetchedAlbums.length} total survived after established-artist check (this genre's cumulative count).`);
         }
       }
     } catch (err) {
