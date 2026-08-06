@@ -2622,22 +2622,46 @@ app.get("/api/artists/:id", async (req, res) => {
       // Fetch Artist and Albums in parallel — track count on each album
       // entry is what actually distinguishes singles from full albums.
       const artistUrl = `https://api.music.apple.com/v1/catalog/${storefront}/artists/${cleanId}`;
-            // Apple's own API does NOT sort this relationship by release date by
+      // Apple's own API does NOT sort this relationship by release date by
       // default — the order is effectively arbitrary. Without an explicit
       // sort, a prolific artist's newest release can easily fall outside
       // the first 50 results and appear "missing" even though it exists in
       // the catalog right now. This sort parameter is undocumented but
       // confirmed working through community testing.
-      const albumsUrl = `https://api.music.apple.com/v1/catalog/${storefront}/artists/${cleanId}/albums?limit=50&sort=-releaseDate`;
+      const firstAlbumsUrl = `https://api.music.apple.com/v1/catalog/${storefront}/artists/${cleanId}/albums?limit=50&sort=-releaseDate`;
 
-      const [artistRes, albumsRes] = await Promise.all([
+      const [artistRes, firstAlbumsRes] = await Promise.all([
         fetch(artistUrl, { headers: { "Authorization": `Bearer ${developerToken}` } }),
-        fetch(albumsUrl, { headers: { "Authorization": `Bearer ${developerToken}` } })
+        fetch(firstAlbumsUrl, { headers: { "Authorization": `Bearer ${developerToken}` } })
       ]);
 
       if (artistRes.ok) {
         const artistData = await artistRes.json() as any;
-        const albumsData = albumsRes.ok ? await albumsRes.json() as any : null;
+        let albumsData = firstAlbumsRes.ok ? await firstAlbumsRes.json() as any : null;
+
+        // A prolific artist can genuinely have more than 50 catalog
+        // entries once every deluxe edition, reissue, and compilation is
+        // counted — without pagination here, their page would silently
+        // cut off partway through with no way to scroll to the rest, even
+        // though the scroll container itself works fine. Keep fetching
+        // additional pages as long as each one comes back full, up to a
+        // reasonable safety cap so a genuinely unusual catalog can't cause
+        // runaway API calls.
+        if (albumsData?.data && albumsData.data.length === 50) {
+          let offset = 50;
+          const maxTotal = 300;
+          while (albumsData.data.length < maxTotal) {
+            const nextUrl = `https://api.music.apple.com/v1/catalog/${storefront}/artists/${cleanId}/albums?limit=50&offset=${offset}&sort=-releaseDate`;
+            const nextRes = await fetch(nextUrl, { headers: { "Authorization": `Bearer ${developerToken}` } });
+            if (!nextRes.ok) break;
+            const nextData = await nextRes.json() as any;
+            const nextItems = nextData?.data || [];
+            if (nextItems.length === 0) break;
+            albumsData.data = albumsData.data.concat(nextItems);
+            if (nextItems.length < 50) break; // reached the actual end
+            offset += 50;
+          }
+        }
 
         const artistItem = artistData.data?.[0];
         if (artistItem) {
