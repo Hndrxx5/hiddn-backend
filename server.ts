@@ -3979,14 +3979,18 @@ app.get("/api/users/:email", requireAuth, async (req: AuthedRequest, res) => {
       [req.userId, row.id]
     );
 
+    const actualReviews = (row.sync_data && Array.isArray(row.sync_data.diary)) ? row.sync_data.diary : [];
+    const actualCollections = (row.sync_data && Array.isArray(row.sync_data.collections)) ? row.sync_data.collections : [];
+    console.log(`[USER LOOKUP] ${email}: returning ${actualReviews.length} reviews, ${actualCollections.length} collections. Raw sync_data.diary type: ${typeof row.sync_data?.diary}, isArray: ${Array.isArray(row.sync_data?.diary)}`);
+
     res.json({
       user: {
         ...toPublicUser(row),
         followersCount: parseInt(followerCountResult.rows[0].count, 10),
         followingCount: parseInt(followingCountResult.rows[0].count, 10),
         isFollowing: isFollowingResult.rows.length > 0,
-        reviews: (row.sync_data && Array.isArray(row.sync_data.diary)) ? row.sync_data.diary : [],
-        collections: (row.sync_data && Array.isArray(row.sync_data.collections)) ? row.sync_data.collections : [],
+        reviews: actualReviews,
+        collections: actualCollections,
       },
     });
   } catch (error: any) {
