@@ -3250,6 +3250,15 @@ app.post("/api/block", requireAuth, async (req: AuthedRequest, res) => {
       [req.userId, blockedUserId]
     );
 
+    // Blocking someone should fully sever the connection — remove any
+    // existing follow relationship in either direction, not just record
+    // the block itself. Without this, a blocked user could still show up
+    // in followers/following, which defeats the point of blocking them.
+    await pool!.query(
+      "delete from follows where (follower_id = $1 and followed_id = $2) or (follower_id = $2 and followed_id = $1)",
+      [req.userId, blockedUserId]
+    );
+
     res.json({ success: true });
   } catch (error: any) {
     console.error("Block error:", error);
@@ -4019,6 +4028,15 @@ app.get("/api/users/:email", requireAuth, async (req: AuthedRequest, res) => {
     }
     const row = result.rows[0];
 
+    const blockCheckResult = await pool!.query(
+      "select 1 from blocks where (blocker_id = $1 and blocked_id = $2) or (blocker_id = $2 and blocked_id = $1)",
+      [req.userId, row.id]
+    );
+    if (blockCheckResult.rows.length > 0) {
+      res.status(403).json({ error: "This profile isn't available." });
+      return;
+    }
+
     const followerCountResult = await pool!.query("select count(*) from follows where followed_id = $1", [row.id]);
     const followingCountResult = await pool!.query("select count(*) from follows where follower_id = $1", [row.id]);
     const isFollowingResult = await pool!.query(
@@ -4153,8 +4171,8 @@ app.post("/api/sync", requireAuth, async (req: AuthedRequest, res) => {
     const incomingDiaryCount = Array.isArray(syncData.diary) ? syncData.diary.length : 0;
     const incomingCollectionsCount = Array.isArray(syncData.collections) ? syncData.collections.length : 0;
 
-    const diaryDropSuspicious = existingDiaryCount >= 5 && incomingDiaryCount < existingDiaryCount * 0.5;
-    const collectionsDropSuspicious = existingCollectionsCount >= 2 && incomingCollectionsCount === 0;
+    const diaryDropSuspicious = existingDiaryCount >= 3 && incomingDiaryCount < existingDiaryCount - 1;
+    const collectionsDropSuspicious = existingCollectionsCount >= 2 && incomingCollectionsCount < existingCollectionsCount - 1;
 
     if (diaryDropSuspicious || collectionsDropSuspicious) {
       console.error(
