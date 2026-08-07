@@ -261,6 +261,25 @@ const DEFAULT_AVATAR_PALETTE = [
   "#06b6d4", "#f97316", "#14b8a6", "#a855f7", "#22c55e", "#6366f1",
 ];
 
+// A starter set of terms that should never appear in submitted content.
+// This intentionally stays limited to unambiguous profanity/slurs rather
+// than being exhaustive — expand this list based on what actually shows
+// up in reports over time. This is deliberately a proactive first line of
+// defense; report + block + 24-hour review remain the primary moderation
+// path for anything more contextual than a flat word match.
+const OBJECTIONABLE_TERMS: string[] = [
+  "fuck", "shit", "bitch", "cunt", "nigger", "nigga", "faggot", "retard",
+  "kike", "spic", "chink", "tranny",
+];
+
+function containsObjectionableContent(text: string): boolean {
+  const normalized = text.toLowerCase().replace(/[^a-z0-9\s]/g, "");
+  return OBJECTIONABLE_TERMS.some((term) => {
+    const pattern = new RegExp(`\\b${term}\\b`, "i");
+    return pattern.test(normalized);
+  });
+}
+
 function generateDefaultAvatar(seed: string): string {
   let hash = 0;
   for (let i = 0; i < seed.length; i++) {
@@ -3588,6 +3607,10 @@ app.post("/api/comments", requireAuth, async (req: AuthedRequest, res) => {
       res.status(400).json({ error: "reviewId and text are required." });
       return;
     }
+    if (containsObjectionableContent(text)) {
+      res.status(400).json({ error: "This comment contains language that isn't allowed on hiddn." });
+      return;
+    }
 
     const insertResult = await pool!.query(
       "insert into review_comments (user_id, review_id, text, parent_comment_id) values ($1, $2, $3, $4) returning id, created_at",
@@ -4433,7 +4456,15 @@ app.get("/terms", (req, res) => {
     <li>Post spam, or use the app for unauthorized commercial purposes.</li>
     <li>Attempt to gain unauthorized access to other accounts or to hiddn's systems.</li>
   </ul>
-  <p>We may remove content or suspend or terminate accounts that violate these Terms. You can report content or accounts, and block other users, from within the app.</p>
+
+  <h2>Zero tolerance for objectionable content and abusive behavior</h2>
+  <p><strong>hiddn has zero tolerance for objectionable content or abusive users.</strong> This includes content that is illegal, hateful, harassing, threatening, sexually explicit, or that promotes violence or discrimination against any individual or group.</p>
+  <p>If you encounter content or a user that violates this policy:</p>
+  <ul>
+    <li><strong>Report it.</strong> Every comment and review in the app includes a Report option. You can also block any user directly from their profile, which immediately hides their content from your experience.</li>
+    <li><strong>We act quickly.</strong> Reports are reviewed and acted on within 24 hours. Content found to violate this policy is removed, and the user responsible is subject to suspension or permanent removal from hiddn.</li>
+  </ul>
+  <p>We may remove content or suspend or terminate accounts that violate these Terms, with or without prior notice.</p>
 
   <h2>Music and third-party data</h2>
   <p>Album artwork, track listings, and related music metadata are sourced from Apple's music catalog and displayed for informational purposes. hiddn is not affiliated with Apple Inc.</p>
