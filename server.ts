@@ -4137,6 +4137,36 @@ app.post("/api/sync", requireAuth, async (req: AuthedRequest, res) => {
       res.status(413).json({ error: "Sync data too large." });
       return;
     }
+
+    // Defense against a real, recurring class of client-side bug: an
+    // account-switching race condition can occasionally cause the app to
+    // sync stale/wrong data over a user's real content. The fingerprint is
+    // always the same — a sudden, drastic drop in how many reviews or
+    // lists an account has. A genuine user essentially never deletes most
+    // of their own content in a single sync; this pattern is a strong
+    // signal something client-side went wrong, not a real user action.
+    // Reject the sync outright rather than silently accepting data loss.
+    const existingResult = await pool!.query("select sync_data from users where id = $1", [req.userId]);
+    const existing = existingResult.rows[0]?.sync_data;
+    const existingDiaryCount = Array.isArray(existing?.diary) ? existing.diary.length : 0;
+    const existingCollectionsCount = Array.isArray(existing?.collections) ? existing.collections.length : 0;
+    const incomingDiaryCount = Array.isArray(syncData.diary) ? syncData.diary.length : 0;
+    const incomingCollectionsCount = Array.isArray(syncData.collections) ? syncData.collections.length : 0;
+
+    const diaryDropSuspicious = existingDiaryCount >= 5 && incomingDiaryCount < existingDiaryCount * 0.5;
+    const collectionsDropSuspicious = existingCollectionsCount >= 2 && incomingCollectionsCount === 0;
+
+    if (diaryDropSuspicious || collectionsDropSuspicious) {
+      console.error(
+        `[SYNC BLOCKED] Suspicious data-loss sync rejected for user ${req.userId}: ` +
+        `diary ${existingDiaryCount} -> ${incomingDiaryCount}, collections ${existingCollectionsCount} -> ${incomingCollectionsCount}`
+      );
+      res.status(409).json({
+        error: "This sync would remove most of your existing reviews or lists, which looks unintentional. It's been blocked to protect your data — please contact support if this was actually intended.",
+      });
+      return;
+    }
+
     await pool!.query("update users set sync_data = $1 where id = $2", [JSON.stringify(syncData), req.userId]);
     res.json({ success: true });
   } catch (error: any) {
