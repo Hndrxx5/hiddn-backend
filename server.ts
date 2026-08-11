@@ -3259,6 +3259,23 @@ app.post("/api/block", requireAuth, async (req: AuthedRequest, res) => {
       [req.userId, blockedUserId]
     );
 
+    // Apple's review guidelines specifically require that blocking a user
+    // also notify the developer, so it can be reviewed as part of ongoing
+    // moderation — not just recorded silently in the database.
+    try {
+      const blockerResult = await pool!.query("select email, username from users where id = $1", [req.userId]);
+      const blockerEmail = blockerResult.rows[0]?.email || "unknown";
+      const blockerUsername = blockerResult.rows[0]?.username || "unknown";
+      await sendEmail(
+        EMAIL_FROM,
+        `User blocked on hiddn: ${blockerUsername}`,
+        `<p><strong>${blockerUsername}</strong> (${blockerEmail}) just blocked <strong>${blockedUserEmail}</strong>.</p>
+         <p>Worth checking whether this warrants a closer look at the blocked account's recent activity.</p>`
+      );
+    } catch (notifyErr) {
+      console.error("Failed to send block notification email:", notifyErr);
+    }
+
     res.json({ success: true });
   } catch (error: any) {
     console.error("Block error:", error);
