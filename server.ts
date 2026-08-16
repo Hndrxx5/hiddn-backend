@@ -4098,6 +4098,22 @@ app.patch("/api/profile", requireAuth, async (req: AuthedRequest, res) => {
     const location = req.body?.location !== undefined ? String(req.body.location).slice(0, 200) : undefined;
     const website = req.body?.website !== undefined ? String(req.body.website).slice(0, 300) : undefined;
     const favorites = Array.isArray(req.body?.favorites) ? req.body.favorites : undefined;
+    const username = req.body?.username !== undefined ? String(req.body.username).trim().slice(0, 50) : undefined;
+
+    if (username !== undefined) {
+      if (!username) {
+        res.status(400).json({ error: "Username cannot be empty." });
+        return;
+      }
+      const existingUsername = await pool!.query(
+        "select id from users where lower(username) = lower($1) and id != $2",
+        [username, req.userId]
+      );
+      if (existingUsername.rows.length > 0) {
+        res.status(409).json({ error: "This username is already taken. Please choose another." });
+        return;
+      }
+    }
 
     const fields: string[] = [];
     const values: any[] = [];
@@ -4107,6 +4123,7 @@ app.patch("/api/profile", requireAuth, async (req: AuthedRequest, res) => {
     if (location !== undefined) { fields.push(`location = $${i++}`); values.push(location); }
     if (website !== undefined) { fields.push(`website = $${i++}`); values.push(website); }
     if (favorites !== undefined) { fields.push(`favorites = $${i++}`); values.push(JSON.stringify(favorites)); }
+    if (username !== undefined) { fields.push(`username = $${i++}`); values.push(username); }
 
     if (fields.length === 0) {
       res.status(400).json({ error: "No profile fields provided to update." });
@@ -4124,6 +4141,10 @@ app.patch("/api/profile", requireAuth, async (req: AuthedRequest, res) => {
     }
     res.json({ user: toPublicUser(result.rows[0]) });
   } catch (error: any) {
+    if (error.code === "23505") {
+      res.status(409).json({ error: "This username is already taken. Please choose another." });
+      return;
+    }
     console.error("Profile update error:", error);
     res.status(500).json({ error: "Failed to update profile", details: error.message });
   }
