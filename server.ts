@@ -4243,19 +4243,25 @@ app.get("/api/search-users", requireAuth, async (req: AuthedRequest, res) => {
       return;
     }
     const result = await pool!.query(
-      `select id, email, username, bio, avatar_url
-       from users
-       where username ilike $1 and id != $2
-       order by username asc
+      `select u.id, u.email, u.username, u.bio, u.avatar_url,
+              exists (
+                select 1 from follows f where f.follower_id = $2 and f.followed_id = u.id
+              ) as is_following
+       from users u
+       where u.username ilike $1 and u.id != $2
+       order by u.username asc
        limit 20`,
       [`%${q}%`, req.userId]
     );
     res.json({
       users: result.rows.map((r: any) => ({
+        id: r.email,
         email: r.email,
         username: r.username,
+        name: r.username,
         bio: r.bio || "",
         avatarUrl: r.avatar_url || generateDefaultAvatar(r.email),
+        isFollowing: !!r.is_following,
       })),
     });
   } catch (error: any) {
