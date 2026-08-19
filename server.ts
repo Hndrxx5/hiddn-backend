@@ -4158,6 +4158,48 @@ app.patch("/api/profile", requireAuth, async (req: AuthedRequest, res) => {
 // continuity and reinstall-survival without the risk of a full real-time
 // sync rewrite.
 
+// Album ratings are stored per-user inside each user's own sync_data blob
+// (there's no separate reviews table), so a single client has no way to see
+// ratings from people whose reviews it doesn't already have locally cached.
+// This endpoint computes the true, global average by scanning every user's
+// diary for the requested albums, so scores reflect everyone who's actually
+// reviewed the album — not just whatever the client happens to already know.
+app.post("/api/album-ratings", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const albumIds = Array.isArray(req.body?.albumIds)
+      ? req.body.albumIds.filter((x: any) => typeof x === "string" && x).slice(0, 200)
+      : [];
+    if (albumIds.length === 0) {
+      res.json({ ratings: {} });
+      return;
+    }
+    const result = await pool!.query(
+      `select entry->'album'->>'id' as album_id,
+              avg((entry->>'rating')::numeric) as avg_rating,
+              count(*) as review_count
+       from users, jsonb_array_elements(coalesce(sync_data->'diary', '[]'::jsonb)) as entry
+       where entry->'album'->>'id' = any($1::text[])
+       group by entry->'album'->>'id'`,
+      [albumIds]
+    );
+    const ratings: Record<string, { averageRating: number; reviewCount: number }> = {};
+    for (const row of result.rows) {
+      ratings[row.album_id] = {
+        averageRating: Math.round(parseFloat(row.avg_rating) * 10) / 10,
+        reviewCount: parseInt(row.review_count, 10),
+      };
+    }
+    res.json({ ratings });
+  } catch (error: any) {
+    console.error("Fetch album ratings error:", error);
+    res.status(500).json({ error: "Failed to load album ratings", details: error.message });
+  }
+});
+
 app.get("/api/sync", requireAuth, async (req: AuthedRequest, res) => {
   if (!accountsAvailable()) {
     res.status(503).json({ error: "Accounts are not configured on this server yet." });
