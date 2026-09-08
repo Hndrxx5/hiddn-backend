@@ -2244,14 +2244,23 @@ async function syncLatestDrops() {
       recentFallbackList.forEach((album) => {
         const key = getAlbumKey(album.name, album.artist);
         if (seenIds.has(album.id) || seenKeys.has(key)) return;
-        
-        let releaseDateStr = album.releaseDate || "2026-07-12";
+
+        // Fall back to a date computed relative to right now (2 days ago),
+        // rather than a fixed calendar date baked into the code — a static
+        // date only stays valid for a moment and silently becomes stale
+        // (and eventually gets filtered out entirely) as real time passes.
+        const dynamicFallbackDate = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000);
+        const dfY = dynamicFallbackDate.getFullYear();
+        const dfM = String(dynamicFallbackDate.getMonth() + 1).padStart(2, '0');
+        const dfD = String(dynamicFallbackDate.getDate()).padStart(2, '0');
+        const dynamicFallbackDateStr = `${dfY}-${dfM}-${dfD}`;
+        let releaseDateStr = album.releaseDate || dynamicFallbackDateStr;
         const releaseDateObj = new Date(releaseDateStr);
         const diffMs = now.getTime() - releaseDateObj.getTime();
         const diffDays = diffMs / (1000 * 60 * 60 * 24);
 
         if (diffDays > 14 || diffDays < 0) {
-          releaseDateStr = "2026-07-12";
+          releaseDateStr = dynamicFallbackDateStr;
         }
 
         freshFetchedAlbums.push({
@@ -2324,15 +2333,27 @@ async function syncLatestDrops() {
 
     latestDropsCache[cacheKey] = [];
 
-    // Save strictly filtered releases
     // Merge in the established-artist supplement for this specific genre —
-    // matched by whether Apple's own genre tags for that release include
-    // this genre's name, or if we're building the "All Genres" bucket.
+    // matched against an explicit, curated set of genre-tag keywords per
+    // genre rather than loose substring matching. A bidirectional "does
+    // either string contain the other" check is too easy to accidentally
+    // satisfy with short or unusual genre tags Apple Music happens to
+    // return, which is exactly how an album from an unrelated genre can
+    // end up bleeding into a genre it has no real connection to.
+    const genreMatchKeywords: Record<string, string[]> = {
+      "rock": ["rock"],
+      "alternative": ["alternative", "indie"],
+      "country": ["country"],
+      "electronic": ["electronic", "edm", "dance", "house", "techno"],
+      "hip-hop": ["hip-hop", "hip hop", "rap"],
+      "pop": ["pop"],
+      "r&b": ["r&b", "rnb", "r & b", "soul"],
+    };
     const matchingSupplement = establishedArtistReleases.filter((rel: any) => {
       if (genreName === "All Genres") return true;
       const relGenres: string[] = (rel.genres || []).map((g: string) => g.toLowerCase());
-      const target = genreName.toLowerCase();
-      return relGenres.some((g) => g.includes(target) || target.includes(g));
+      const keywords = genreMatchKeywords[cacheKey] || [];
+      return relGenres.some((g) => keywords.some((kw) => g.includes(kw)));
     });
     for (const supplement of matchingSupplement) {
       const alreadyPresent = processedAlbums.some(
