@@ -1741,14 +1741,35 @@ async function isArtistEstablished(artistName: string, token: string): Promise<b
       return false;
     }
     const albumsJson: any = await albumsRes.json();
-    const albumCount = (albumsJson?.data || []).length;
+    const albumsData: any[] = albumsJson?.data || [];
+    const albumCount = albumsData.length;
     // limit=5 means this only distinguishes "0-4" from "5", but combined
     // with the meta.total field when present, or just this count, 3+ is
     // still a meaningful signal — an artist with fewer than 3 total
     // catalog entries is very unlikely to be genuinely established.
     const total = albumsJson?.meta?.total;
-    const established = typeof total === "number" ? total >= 3 : albumCount >= 3;
-    console.log(`[isArtistEstablished] "${artistName}" (id ${artistId}): meta.total=${total}, returned albumCount=${albumCount} -> established=${established}`);
+    const hasEnoughAlbums = typeof total === "number" ? total >= 3 : albumCount >= 3;
+
+    // A second, independent signal beyond raw album count: a genuinely
+    // established artist's catalog naturally spans months or years. An
+    // account that dumps several albums all at once (a known pattern for
+    // spam/AI-generated "artists" gaming a simple count threshold) can
+    // clear the 3+ bar without ever having actually built a real career.
+    // Requiring their sampled albums to span at least ~4 months catches
+    // that specific gap without penalizing real, prolific artists.
+    let spansRealTime = false;
+    const releaseTimes = albumsData
+      .map((a) => new Date(a?.attributes?.releaseDate || "").getTime())
+      .filter((t) => !isNaN(t));
+    if (releaseTimes.length >= 2) {
+      const oldestMs = Math.min(...releaseTimes);
+      const newestMs = Math.max(...releaseTimes);
+      const spanDays = (newestMs - oldestMs) / (1000 * 60 * 60 * 24);
+      spansRealTime = spanDays >= 120;
+    }
+
+    const established = hasEnoughAlbums && spansRealTime;
+    console.log(`[isArtistEstablished] "${artistName}" (id ${artistId}): meta.total=${total}, returned albumCount=${albumCount}, spansRealTime=${spansRealTime} -> established=${established}`);
     artistEstablishedCache[artistName] = established;
     return established;
   } catch (err: any) {
@@ -2229,53 +2250,14 @@ async function syncLatestDrops() {
       seenKeys.add(getAlbumKey(album.name, album.artist));
     });
 
-    // Fallback Mocking — only when the real Apple Music API genuinely didn't
-    // work (no token, network failure, etc). A real API success with fewer
-    // than 4 results is an honest "not much dropped this week," not a
-    // reason to pad the list with curated data that isn't from this week.
-    if (!realApiSucceeded && freshFetchedAlbums.length < 4) {
-      console.log(`Generating high-fidelity fallback drops for ${genreName} strictly within the 14-day filter...`);
-      
-      let recentFallbackList = curatedLatestDrops[cacheKey] || [];
-      if (cacheKey === "all" || recentFallbackList.length === 0) {
-        recentFallbackList = Object.values(curatedLatestDrops).flat();
-      }
-
-      recentFallbackList.forEach((album) => {
-        const key = getAlbumKey(album.name, album.artist);
-        if (seenIds.has(album.id) || seenKeys.has(key)) return;
-
-        // Fall back to a date computed relative to right now (2 days ago),
-        // rather than a fixed calendar date baked into the code — a static
-        // date only stays valid for a moment and silently becomes stale
-        // (and eventually gets filtered out entirely) as real time passes.
-        const dynamicFallbackDate = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000);
-        const dfY = dynamicFallbackDate.getFullYear();
-        const dfM = String(dynamicFallbackDate.getMonth() + 1).padStart(2, '0');
-        const dfD = String(dynamicFallbackDate.getDate()).padStart(2, '0');
-        const dynamicFallbackDateStr = `${dfY}-${dfM}-${dfD}`;
-        let releaseDateStr = album.releaseDate || dynamicFallbackDateStr;
-        const releaseDateObj = new Date(releaseDateStr);
-        const diffMs = now.getTime() - releaseDateObj.getTime();
-        const diffDays = diffMs / (1000 * 60 * 60 * 24);
-
-        if (diffDays > 14 || diffDays < 0) {
-          releaseDateStr = dynamicFallbackDateStr;
-        }
-
-        freshFetchedAlbums.push({
-          id: album.id,
-          name: album.name,
-          artist: album.artist,
-          coverUrl: album.coverUrl,
-          genres: album.genres || [genreName],
-          releaseDate: releaseDateStr,
-          originalReleaseTime: new Date(releaseDateStr).getTime()
-        });
-        seenIds.add(album.id);
-        seenKeys.add(key);
-      });
-    }
+    // Note: an earlier fallback here padded thin results with curated
+    // "recent" album data when the real API came back with too few results.
+    // That curated data turned out to contain fictional, hardcoded release
+    // dates for real albums (e.g. SZA's "SOS" — an album from years ago —
+    // labeled with a made-up date making it look like it dropped days ago).
+    // Removed entirely: showing genuinely fewer albums for a quiet week is
+    // honest; padding the list with fabricated recency is not, regardless
+    // of how real and well-known the underlying album actually is.
 
     // Helper to format Date to standard YYYY-MM-DD format
     const toYMD = (dateObj: Date): string => {
@@ -2365,14 +2347,19 @@ async function syncLatestDrops() {
     }
     processedAlbums.sort((a, b) => b.originalReleaseTime - a.originalReleaseTime);
 
-    // Never-empty fallback: if this genre genuinely has zero qualifying
-    // releases even after the supplement, widen the window and re-check
-    // the same trusted Apple chart source — never fall back to anything
-    // unfiltered, just look further back in time from the same place.
-    if (processedAlbums.length === 0) {
+    // Keep-it-healthy fallback: if this genre has thin results even after
+    // the supplement, widen the window and re-check the same trusted Apple
+    // chart source — never fall back to anything fabricated, just look
+    // further back in time from the same real, live data source. This
+    // used to only trigger on genuinely zero results; now it also helps
+    // top up a quiet week's handful of real releases, still with every
+    // other quality check (established artist, no singles) intact.
+    if (processedAlbums.length < 4) {
       const fallbackToken = process.env.APPLE_DEVELOPER_TOKEN || process.env.APPLE_MUSIC_JWT;
       if (fallbackToken) {
         try {
+          const existingIds = new Set(processedAlbums.map((a) => a.id));
+          const existingKeys = new Set(processedAlbums.map((a) => getAlbumKey(a.name, a.artist)));
           const wideUrl = `https://api.music.apple.com/v1/catalog/us/charts?types=albums${genreId ? `&genre=${genreId}` : ""}&chart=new-releases&limit=30`;
           const wideRes = await fetch(wideUrl, { headers: { Authorization: `Bearer ${fallbackToken}` } });
           if (wideRes.ok) {
@@ -2381,20 +2368,25 @@ async function syncLatestDrops() {
             const nowMs = now.getTime();
             const sixtyDaysMs = 60 * 24 * 60 * 60 * 1000;
             for (const album of wideAlbumsData) {
+              if (processedAlbums.length >= 8) break;
               const attrs = album.attributes;
               if (!attrs?.releaseDate) continue;
               const releaseTime = new Date(attrs.releaseDate).getTime();
               if (isNaN(releaseTime) || nowMs - releaseTime > sixtyDaysMs || releaseTime > nowMs) continue;
               const trackCount = attrs.trackCount || 0;
               if (trackCount <= 1) continue; // still exclude singles here too
+              const fallbackName = attrs.name || "Unknown";
               const fallbackArtist = attrs.artistName || "Unknown Artist";
+              const fallbackId = String(album.id);
+              const fallbackKey = getAlbumKey(fallbackName, fallbackArtist);
+              if (existingIds.has(fallbackId) || existingKeys.has(fallbackKey)) continue;
               const fallbackEstablished = await isArtistEstablished(fallbackArtist, fallbackToken);
               if (!fallbackEstablished) continue;
               const rawArtwork = attrs.artwork?.url || "";
               processedAlbums.push({
-                id: String(album.id),
-                name: attrs.name || "Unknown",
-                artist: attrs.artistName || "Unknown Artist",
+                id: fallbackId,
+                name: fallbackName,
+                artist: fallbackArtist,
                 coverUrl: rawArtwork.replace("{w}", "600").replace("{h}", "600"),
                 genres: attrs.genreNames || [],
                 releaseDate: attrs.releaseDate,
@@ -2403,9 +2395,11 @@ async function syncLatestDrops() {
                 reviewCount: 0,
                 originalReleaseTime: releaseTime,
               });
+              existingIds.add(fallbackId);
+              existingKeys.add(fallbackKey);
             }
             if (processedAlbums.length > 0) {
-              console.log(` -> FALLBACK: Genre '${genreName}' had no releases in the normal window, widened to 60 days and found ${processedAlbums.length}.`);
+              console.log(` -> FALLBACK: Genre '${genreName}' had thin results in the normal window, widened to 60 days and now has ${processedAlbums.length}.`);
             }
           }
         } catch (fallbackErr: any) {
