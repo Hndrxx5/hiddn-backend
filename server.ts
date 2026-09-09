@@ -2066,6 +2066,17 @@ async function syncLatestDrops() {
             continue;
           }
 
+          // This RSS fallback never checked artist legitimacy at all, unlike
+          // the primary Apple Music chart path — meaning a spam/AI-generated
+          // "artist" could slip straight through whenever the primary path
+          // doesn't succeed. Apply the same established-artist bar here too,
+          // whenever a token is actually available to check it with.
+          const rssV2Token = process.env.APPLE_DEVELOPER_TOKEN || process.env.APPLE_MUSIC_JWT;
+          if (rssV2Token) {
+            const rssV2Established = await isArtistEstablished(artist, rssV2Token);
+            if (!rssV2Established) continue;
+          }
+
           fetchedAlbums.push({
             id,
             name,
@@ -2145,6 +2156,14 @@ async function syncLatestDrops() {
             (cacheKey === "electronic" && (primaryGenre.toLowerCase().includes("electronic") || primaryGenre.toLowerCase().includes("edm") || primaryGenre.toLowerCase().includes("dance")));
 
           if (!isGenreMatch) continue;
+
+          // Same gap as the v2 RSS fallback above - this path never checked
+          // artist legitimacy either. Apply the same bar here too.
+          const rssV1Token = process.env.APPLE_DEVELOPER_TOKEN || process.env.APPLE_MUSIC_JWT;
+          if (rssV1Token) {
+            const rssV1Established = await isArtistEstablished(artist, rssV1Token);
+            if (!rssV1Established) continue;
+          }
 
           fetchedAlbums.push({
             id,
