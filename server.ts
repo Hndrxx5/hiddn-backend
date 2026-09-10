@@ -1748,28 +1748,18 @@ async function isArtistEstablished(artistName: string, token: string): Promise<b
     // still a meaningful signal — an artist with fewer than 3 total
     // catalog entries is very unlikely to be genuinely established.
     const total = albumsJson?.meta?.total;
-    const hasEnoughAlbums = typeof total === "number" ? total >= 3 : albumCount >= 3;
+    const established = typeof total === "number" ? total >= 3 : albumCount >= 3;
 
-    // A second, independent signal beyond raw album count: a genuinely
-    // established artist's catalog naturally spans months or years. An
-    // account that dumps several albums all at once (a known pattern for
-    // spam/AI-generated "artists" gaming a simple count threshold) can
-    // clear the 3+ bar without ever having actually built a real career.
-    // Requiring their sampled albums to span at least ~4 months catches
-    // that specific gap without penalizing real, prolific artists.
-    let spansRealTime = false;
-    const releaseTimes = albumsData
-      .map((a) => new Date(a?.attributes?.releaseDate || "").getTime())
-      .filter((t) => !isNaN(t));
-    if (releaseTimes.length >= 2) {
-      const oldestMs = Math.min(...releaseTimes);
-      const newestMs = Math.max(...releaseTimes);
-      const spanDays = (newestMs - oldestMs) / (1000 * 60 * 60 * 24);
-      spansRealTime = spanDays >= 120;
-    }
+    // Note: a time-span requirement (an artist's albums needing to span
+    // several weeks/months) was tried here as a second signal against
+    // spam/AI-generated "artists" that dump several fake albums at once.
+    // Removed — it also excludes real, legitimate, newer artists who
+    // simply haven't been releasing music that long yet, which is a very
+    // normal pattern for an artist breaking through, not a spam signal.
+    // That trade-off wasn't worth it: a real, wanted album not showing up
+    // is worse than an occasional spam album slipping through.
 
-    const established = hasEnoughAlbums && spansRealTime;
-    console.log(`[isArtistEstablished] "${artistName}" (id ${artistId}): meta.total=${total}, returned albumCount=${albumCount}, spansRealTime=${spansRealTime} -> established=${established}`);
+    console.log(`[isArtistEstablished] "${artistName}" (id ${artistId}): meta.total=${total}, returned albumCount=${albumCount} -> established=${established}`);
     artistEstablishedCache[artistName] = established;
     return established;
   } catch (err: any) {
