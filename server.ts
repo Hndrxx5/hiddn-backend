@@ -2418,8 +2418,31 @@ async function syncLatestDrops() {
       }
     }
 
+    // Merge with whatever's already cached, rather than fully replacing it.
+    // The primary source is a ranked top-30 popularity chart, not a
+    // comprehensive feed of everything released — a brand new album can
+    // rank highly the moment it drops, then lose that chart position
+    // within hours as other albums overtake it, even though it's still
+    // genuinely recent. Without this merge, that album would vanish from
+    // the app the next sync purely because it fell out of that specific
+    // snapshot's top 30, not because it actually aged past 14 days.
+    const previouslyCached = latestDropsCache[cacheKey] || [];
+    const stillRecentPrevious = previouslyCached.filter((album: any) => {
+      const ageMs = now.getTime() - (album.originalReleaseTime || 0);
+      const ageDays = ageMs / (1000 * 60 * 60 * 24);
+      return ageDays >= 0 && ageDays <= 14;
+    });
+    const mergedIds = new Set(processedAlbums.map((a) => a.id));
+    for (const album of stillRecentPrevious) {
+      if (!mergedIds.has(album.id)) {
+        processedAlbums.push(album);
+        mergedIds.add(album.id);
+      }
+    }
+    processedAlbums.sort((a, b) => b.originalReleaseTime - a.originalReleaseTime);
+
     latestDropsCache[cacheKey] = processedAlbums.slice(0, 16);
-    console.log(` -> SUCCESS: Saved ${latestDropsCache[cacheKey].length} pristine releases for genre '${genreName}'`);
+    console.log(` -> SUCCESS: Saved ${latestDropsCache[cacheKey].length} pristine releases for genre '${genreName}' (${stillRecentPrevious.length} carried over from the previous sync)`);
   }
 
   console.log("===================================================================");
