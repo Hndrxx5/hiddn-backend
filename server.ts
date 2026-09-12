@@ -2435,7 +2435,26 @@ async function syncLatestDrops() {
     // genuinely recent. Without this merge, that album would vanish from
     // the app the next sync purely because it fell out of that specific
     // snapshot's top 30, not because it actually aged past 14 days.
-    const previouslyCached = latestDropsCache[cacheKey] || [];
+    //
+    // Read from the database rather than only the in-memory cache — the
+    // in-memory cache doesn't survive a server restart (which Render's
+    // free tier does automatically after periods of low traffic), so
+    // relying on it alone meant this merge only worked until the next
+    // restart quietly wiped everything it remembered.
+    let previouslyCached: any[] = latestDropsCache[cacheKey] || [];
+    if (pool) {
+      try {
+        const dbCacheRes = await pool.query(
+          "select albums from latest_drops_cache where genre_key = $1",
+          [cacheKey]
+        );
+        if (dbCacheRes.rows.length > 0 && Array.isArray(dbCacheRes.rows[0].albums)) {
+          previouslyCached = dbCacheRes.rows[0].albums;
+        }
+      } catch (dbReadErr: any) {
+        console.error(`Failed to read persisted latest-drops cache for '${genreName}', falling back to in-memory:`, dbReadErr.message);
+      }
+    }
     const stillRecentPrevious = previouslyCached.filter((album: any) => {
       const ageMs = now.getTime() - (album.originalReleaseTime || 0);
       const ageDays = ageMs / (1000 * 60 * 60 * 24);
@@ -2450,8 +2469,21 @@ async function syncLatestDrops() {
     }
     processedAlbums.sort((a, b) => b.originalReleaseTime - a.originalReleaseTime);
 
-    latestDropsCache[cacheKey] = processedAlbums.slice(0, 16);
-    console.log(` -> SUCCESS: Saved ${latestDropsCache[cacheKey].length} pristine releases for genre '${genreName}' (${stillRecentPrevious.length} carried over from the previous sync)`);
+    const finalAlbumsForGenre = processedAlbums.slice(0, 16);
+    latestDropsCache[cacheKey] = finalAlbumsForGenre;
+    if (pool) {
+      try {
+        await pool.query(
+          `insert into latest_drops_cache (genre_key, albums, updated_at)
+           values ($1, $2::jsonb, now())
+           on conflict (genre_key) do update set albums = excluded.albums, updated_at = now()`,
+          [cacheKey, JSON.stringify(finalAlbumsForGenre)]
+        );
+      } catch (dbWriteErr: any) {
+        console.error(`Failed to persist latest-drops cache for '${genreName}' (in-memory cache still updated):`, dbWriteErr.message);
+      }
+    }
+    console.log(` -> SUCCESS: Saved ${finalAlbumsForGenre.length} pristine releases for genre '${genreName}' (${stillRecentPrevious.length} carried over from the previous sync)`);
   }
 
   console.log("===================================================================");
@@ -4707,6 +4739,24 @@ app.get("/support", (req, res) => {
 
 
 async function startServer() {
+  if (pool) {
+    try {
+      await pool.query(`
+        create table if not exists latest_drops_cache (
+          genre_key varchar(50) primary key,
+          albums jsonb not null default '[]'::jsonb,
+          updated_at timestamptz not null default now()
+        )
+      `);
+      console.log("latest_drops_cache table ready.");
+    } catch (err: any) {
+      // Not fatal — the in-memory cache still works within a single
+      // server run even if this table can't be created for some reason,
+      // it just won't survive a restart without it.
+      console.error("Failed to ensure latest_drops_cache table exists:", err.message);
+    }
+  }
+
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
