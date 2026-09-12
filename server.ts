@@ -1722,13 +1722,21 @@ async function isArtistEstablished(artistName: string, token: string): Promise<b
     const searchUrl = `https://api.music.apple.com/v1/catalog/us/search?term=${encodeURIComponent(artistName)}&types=artists&limit=1`;
     const searchRes = await fetch(searchUrl, { headers: { Authorization: `Bearer ${token}` } });
     if (!searchRes.ok) {
-      console.error(`[isArtistEstablished] "${artistName}": artist search failed, status ${searchRes.status}`);
-      artistEstablishedCache[artistName] = false;
+      // A failed request here is transient (rate limit, network blip, a
+      // momentary Apple API issue) — not evidence the artist is unknown.
+      // Deliberately not cached: caching this would permanently lock a
+      // real artist out until the server restarts, purely because of one
+      // bad response, with every future check just returning the same
+      // stale false forever without ever retrying.
+      console.error(`[isArtistEstablished] "${artistName}": artist search failed, status ${searchRes.status} (not cached, will retry next time)`);
       return false;
     }
     const searchJson: any = await searchRes.json();
     const artistId = searchJson?.results?.artists?.data?.[0]?.id;
     if (!artistId) {
+      // This one is a genuine "no match" rather than a request failure,
+      // so it's safe to cache — a nonexistent/misspelled artist name
+      // isn't going to suddenly start matching on a later retry.
       console.error(`[isArtistEstablished] "${artistName}": no artist match found in search results.`);
       artistEstablishedCache[artistName] = false;
       return false;
@@ -1736,8 +1744,8 @@ async function isArtistEstablished(artistName: string, token: string): Promise<b
     const albumsUrl = `https://api.music.apple.com/v1/catalog/us/artists/${artistId}/albums?limit=5`;
     const albumsRes = await fetch(albumsUrl, { headers: { Authorization: `Bearer ${token}` } });
     if (!albumsRes.ok) {
-      console.error(`[isArtistEstablished] "${artistName}" (id ${artistId}): albums lookup failed, status ${albumsRes.status}`);
-      artistEstablishedCache[artistName] = false;
+      // Same reasoning as the search failure above — transient, not cached.
+      console.error(`[isArtistEstablished] "${artistName}" (id ${artistId}): albums lookup failed, status ${albumsRes.status} (not cached, will retry next time)`);
       return false;
     }
     const albumsJson: any = await albumsRes.json();
@@ -1763,8 +1771,9 @@ async function isArtistEstablished(artistName: string, token: string): Promise<b
     artistEstablishedCache[artistName] = established;
     return established;
   } catch (err: any) {
-    console.error(`[isArtistEstablished] "${artistName}": threw an exception:`, err.message);
-    artistEstablishedCache[artistName] = false;
+    // An exception here (network error, JSON parse failure, etc.) is also
+    // transient — not cached, for the same reason as the two cases above.
+    console.error(`[isArtistEstablished] "${artistName}": threw an exception:`, err.message, "(not cached, will retry next time)");
     return false;
   }
 }
