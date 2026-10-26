@@ -1037,6 +1037,14 @@ const latestDropsCache: Record<string, any[]> = {};
 // keyed by artist name — persists across sync cycles since many artists
 // repeat, avoiding redundant API calls to check the same artist repeatedly.
 const artistEstablishedCache: Record<string, boolean> = {};
+
+// Artists that must never appear in Latest Drops (case-insensitive, substring
+// match so features/variants like "RAVNLORE & Someone" are caught too).
+const BLOCKED_LATEST_DROPS_ARTISTS = ["ravnlore"];
+const isBlockedLatestDropsArtist = (artist: any): boolean => {
+  const a = String(artist || "").toLowerCase();
+  return BLOCKED_LATEST_DROPS_ARTISTS.some((b) => a.includes(b));
+};
 const popularReleasesCache: Record<string, any[]> = {};
 
 // Curated real-world high-profile releases matching Apple Music "New This Week" tab
@@ -2197,6 +2205,7 @@ async function syncLatestDrops() {
 
       const nameLower = album.name.toLowerCase();
       const artistLower = album.artist.toLowerCase();
+      if (isBlockedLatestDropsArtist(album.artist)) return false;
 
       // Blacklist known classic album names
       const isBlacklistedAlbum = 
@@ -2350,6 +2359,7 @@ async function syncLatestDrops() {
       "r&b": ["r&b", "rnb", "r & b", "soul"],
     };
     const matchingSupplement = establishedArtistReleases.filter((rel: any) => {
+      if (isBlockedLatestDropsArtist(rel.artist)) return false;
       if (genreName === "All Genres") return true;
       const relGenres: string[] = (rel.genres || []).map((g: string) => g.toLowerCase());
       const keywords = genreMatchKeywords[cacheKey] || [];
@@ -2395,6 +2405,7 @@ async function syncLatestDrops() {
               if (trackCount <= 1) continue; // still exclude singles here too
               const fallbackName = attrs.name || "Unknown";
               const fallbackArtist = attrs.artistName || "Unknown Artist";
+              if (isBlockedLatestDropsArtist(fallbackArtist)) continue;
               const fallbackId = String(album.id);
               const fallbackKey = getAlbumKey(fallbackName, fallbackArtist);
               if (existingIds.has(fallbackId) || existingKeys.has(fallbackKey)) continue;
@@ -2467,6 +2478,10 @@ async function syncLatestDrops() {
         mergedIds.add(album.id);
       }
     }
+    // Purge blocked artists from everything (including carried-over cache)
+    for (let i = processedAlbums.length - 1; i >= 0; i--) {
+      if (isBlockedLatestDropsArtist(processedAlbums[i].artist)) processedAlbums.splice(i, 1);
+    }
     processedAlbums.sort((a, b) => b.originalReleaseTime - a.originalReleaseTime);
 
     const finalAlbumsForGenre = processedAlbums.slice(0, 16);
@@ -2528,7 +2543,7 @@ app.get("/api/latest-drops", async (req, res) => {
     const twentyOneDaysMs = 21 * 24 * 60 * 60 * 1000;
     const freshResults = rawResults
       .filter((a: any) =>
-        typeof a.originalReleaseTime === "number" && (nowMs - a.originalReleaseTime) <= twentyOneDaysMs
+        typeof a.originalReleaseTime === "number" && (nowMs - a.originalReleaseTime) <= twentyOneDaysMs && !isBlockedLatestDropsArtist(a.artist)
       )
       .map((a: any) => {
         // The timeAgo label itself was computed at sync time (up to 24h
