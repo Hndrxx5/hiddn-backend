@@ -4304,6 +4304,67 @@ app.patch("/api/profile", requireAuth, async (req: AuthedRequest, res) => {
 // This endpoint computes the true, global average by scanning every user's
 // diary for the requested albums, so scores reflect everyone who's actually
 // reviewed the album — not just whatever the client happens to already know.
+// Top 4 artists for a genre, built from the iTunes top-albums chart for that
+// genre (one entry per artist, in chart order). Cached for an hour per genre.
+const genreTopArtistsCache = new Map<string, { at: number; artists: any[] }>();
+app.get("/api/genre-top-artists", async (req, res) => {
+  try {
+    const raw = String(req.query.genre || "").toLowerCase();
+    const ids: [string, string][] = [
+      ["hip", "18"], ["rap", "18"], ["alternative", "20"], ["indie", "20"],
+      ["r&b", "15"], ["soul", "15"], ["electronic", "7"], ["dance", "7"],
+      ["pop", "14"], ["rock", "21"], ["country", "6"],
+    ];
+    const hit = ids.find(([k]) => raw.includes(k));
+    if (!hit) {
+      res.json({ artists: [] });
+      return;
+    }
+    const genreId = hit[1];
+    const cached = genreTopArtistsCache.get(genreId);
+    if (cached && Date.now() - cached.at < 60 * 60 * 1000) {
+      res.json({ artists: cached.artists });
+      return;
+    }
+    const feedRes = await fetch(`https://itunes.apple.com/us/rss/topalbums/genre=${genreId}/limit=60/json`);
+    if (!feedRes.ok) {
+      res.json({ artists: [] });
+      return;
+    }
+    const feed = (await feedRes.json()) as any;
+    const entries: any[] = feed?.feed?.entry || [];
+    const picked: { id: string; name: string; cover: string }[] = [];
+    const seen = new Set<string>();
+    for (const e of entries) {
+      const name = e?.["im:artist"]?.label;
+      const href: string = e?.["im:artist"]?.attributes?.href || "";
+      const m = href.match(/\/artist\/[^/]+\/(\d+)/) || href.match(/\/artist\/(\d+)/);
+      if (!name || !m) continue;
+      const key = m[1];
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const imgs = e?.["im:image"] || [];
+      picked.push({ id: key, name, cover: imgs[imgs.length - 1]?.label || "" });
+      if (picked.length >= 4) break;
+    }
+    const artists = await Promise.all(
+      picked.map(async (p) => {
+        let imageUrl = p.cover ? p.cover.replace(/\d+x\d+bb/, "300x300bb") : "";
+        try {
+          const img = await scrapeArtistImageUrl(p.id, p.name);
+          if (img && !img.includes("unsplash.com")) imageUrl = img;
+        } catch {}
+        return { id: `artist-${p.id}`, name: p.name, imageUrl };
+      })
+    );
+    genreTopArtistsCache.set(genreId, { at: Date.now(), artists });
+    res.json({ artists });
+  } catch (error: any) {
+    console.error("Genre top artists error:", error);
+    res.json({ artists: [] });
+  }
+});
+
 // Popular this week: albums reviewed by the most distinct people recently.
 // Ranked by distinct reviewers (not total logs), ties broken by average
 // rating. Looks back 7 days and widens to 30 if the week is too quiet.
