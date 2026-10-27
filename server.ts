@@ -676,6 +676,7 @@ async function fetchCatalogRaw({
               releaseYear: item.attributes?.releaseDate ? item.attributes.releaseDate.split("-")[0] : "N/A",
               genres: item.attributes?.genreNames || ["Music"],
               type: "album",
+              explicit: item.attributes?.contentRating === "explicit",
               artistId: artistId ? String(artistId) : undefined
             });
           });
@@ -814,6 +815,7 @@ async function fetchCatalogRaw({
             releaseYear: item.releaseDate ? item.releaseDate.split("-")[0] : "N/A",
             genres: item.primaryGenreName ? [item.primaryGenreName] : ["Music"],
             type: "album",
+            explicit: item.collectionExplicitness === "explicit",
             artistId: item.artistId ? String(item.artistId) : undefined
           };
         }
@@ -1846,6 +1848,7 @@ async function fetchEstablishedArtistNewReleases(): Promise<any[]> {
           genres: newest.attributes?.genreNames || [],
           releaseDate: releaseDateStr,
           originalReleaseTime: releaseTime,
+          explicit: newest.attributes?.contentRating === "explicit",
         });
       } catch {
         continue; // one artist failing shouldn't break the whole supplement
@@ -1929,8 +1932,10 @@ async function syncLatestDrops() {
     const fetchedAlbums: any[] = [];
     const seenIds = new Set<string>();
     const seenKeys = new Set<string>();
+    // Strips "(Clean)" / "(Explicit)" tags so the clean and explicit versions
+    // of the same album share one key and can be de-duplicated.
     const getAlbumKey = (name: string, artist: string) => 
-      `${name.toLowerCase().trim()} - ${artist.toLowerCase().trim()}`.replace(/[^a-z0-9]/g, "");
+      `${name.toLowerCase().replace(/[\(\[]\s*(clean|explicit)\s*[\)\]]/g, "").trim()} - ${artist.toLowerCase().trim()}`.replace(/[^a-z0-9]/g, "");
 
     // 1. Optional query to GET /v1/catalog/us/charts?types=albums&genre={genreId} if JWT is present
     let realApiSucceeded = false;
@@ -1975,9 +1980,20 @@ async function syncLatestDrops() {
             const name = attributes.name || "Unknown Album";
             const artist = attributes.artistName || "Unknown Artist";
             const key = getAlbumKey(name, artist);
-            if (seenIds.has(id) || seenKeys.has(key)) continue;
+            const isExplicit = attributes.contentRating === "explicit";
+            if (seenIds.has(id)) continue;
+            if (seenKeys.has(key)) {
+              // Same album already listed. If this copy is the explicit one and
+              // the earlier copy is the clean one, swap in the explicit version.
+              const existing = candidates.find((c) => getAlbumKey(c.name, c.artist) === key);
+              if (existing && isExplicit && !existing.explicit) {
+                Object.assign(existing, { id, name, artist, coverUrl, genres: attributes.genreNames || [genreName], releaseDateStr, originalReleaseTime: releaseDateObj.getTime(), explicit: true });
+                seenIds.add(id);
+              }
+              continue;
+            }
 
-            candidates.push({ id, name, artist, coverUrl, genres: attributes.genreNames || [genreName], releaseDateStr, originalReleaseTime: releaseDateObj.getTime() });
+            candidates.push({ id, name, artist, coverUrl, genres: attributes.genreNames || [genreName], releaseDateStr, originalReleaseTime: releaseDateObj.getTime(), explicit: isExplicit });
             seenIds.add(id);
             seenKeys.add(key);
           }
@@ -2004,7 +2020,8 @@ async function syncLatestDrops() {
               coverUrl: c.coverUrl,
               genres: c.genres,
               releaseDate: c.releaseDateStr,
-              originalReleaseTime: c.originalReleaseTime
+              originalReleaseTime: c.originalReleaseTime,
+              explicit: !!c.explicit
             });
           }
           console.log(`[Chart Filter] ${genreName}: ${fetchedAlbums.length} total survived after established-artist check (this genre's cumulative count).`);
@@ -2091,7 +2108,8 @@ async function syncLatestDrops() {
             coverUrl,
             genres: itemGenres.length > 0 ? itemGenres : [genreName],
             releaseDate: item.releaseDate,
-            originalReleaseTime: releaseDateObj.getTime()
+            originalReleaseTime: releaseDateObj.getTime(),
+            explicit: String(item.contentAdvisoryRating || "").toLowerCase() === "explicit"
           });
           seenIds.add(id);
           seenKeys.add(key);
@@ -2323,7 +2341,8 @@ async function syncLatestDrops() {
         timeAgo,
         averageRating: parseFloat((4.2 + Math.random() * 0.7).toFixed(1)),
         reviewCount: Math.floor(40 + Math.random() * 410),
-        originalReleaseTime: album.originalReleaseTime
+        originalReleaseTime: album.originalReleaseTime,
+        explicit: !!album.explicit
       };
     });
 
@@ -2423,6 +2442,7 @@ async function syncLatestDrops() {
                 averageRating: 0,
                 reviewCount: 0,
                 originalReleaseTime: releaseTime,
+                explicit: attrs.contentRating === "explicit",
               });
               existingIds.add(fallbackId);
               existingKeys.add(fallbackKey);
@@ -2476,6 +2496,20 @@ async function syncLatestDrops() {
       if (!mergedIds.has(album.id)) {
         processedAlbums.push(album);
         mergedIds.add(album.id);
+      }
+    }
+    // One entry per album: if a clean and an explicit version both made it in
+    // (different ids), keep only the explicit one.
+    {
+      const byKey = new Map<string, any>();
+      for (const a of processedAlbums) {
+        const k = getAlbumKey(a.name, a.artist);
+        const prev = byKey.get(k);
+        if (!prev || (a.explicit && !prev.explicit)) byKey.set(k, a);
+      }
+      const keep = new Set(byKey.values());
+      for (let i = processedAlbums.length - 1; i >= 0; i--) {
+        if (!keep.has(processedAlbums[i])) processedAlbums.splice(i, 1);
       }
     }
     // Purge blocked artists from everything (including carried-over cache)
