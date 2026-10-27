@@ -676,6 +676,7 @@ async function fetchCatalogRaw({
               releaseYear: item.attributes?.releaseDate ? item.attributes.releaseDate.split("-")[0] : "N/A",
               genres: item.attributes?.genreNames || ["Music"],
               type: "album",
+              explicit: item.attributes?.contentRating === "explicit",
               artistId: artistId ? String(artistId) : undefined
             });
           });
@@ -814,6 +815,7 @@ async function fetchCatalogRaw({
             releaseYear: item.releaseDate ? item.releaseDate.split("-")[0] : "N/A",
             genres: item.primaryGenreName ? [item.primaryGenreName] : ["Music"],
             type: "album",
+            explicit: item.collectionExplicitness === "explicit",
             artistId: item.artistId ? String(item.artistId) : undefined
           };
         }
@@ -1846,6 +1848,7 @@ async function fetchEstablishedArtistNewReleases(): Promise<any[]> {
           genres: newest.attributes?.genreNames || [],
           releaseDate: releaseDateStr,
           originalReleaseTime: releaseTime,
+          explicit: newest.attributes?.contentRating === "explicit",
         });
       } catch {
         continue; // one artist failing shouldn't break the whole supplement
@@ -1929,8 +1932,10 @@ async function syncLatestDrops() {
     const fetchedAlbums: any[] = [];
     const seenIds = new Set<string>();
     const seenKeys = new Set<string>();
+    // Strips "(Clean)" / "(Explicit)" tags so the clean and explicit versions
+    // of the same album share one key and can be de-duplicated.
     const getAlbumKey = (name: string, artist: string) => 
-      `${name.toLowerCase().trim()} - ${artist.toLowerCase().trim()}`.replace(/[^a-z0-9]/g, "");
+      `${name.toLowerCase().replace(/[\(\[]\s*(clean|explicit)\s*[\)\]]/g, "").trim()} - ${artist.toLowerCase().trim()}`.replace(/[^a-z0-9]/g, "");
 
     // 1. Optional query to GET /v1/catalog/us/charts?types=albums&genre={genreId} if JWT is present
     let realApiSucceeded = false;
@@ -1975,9 +1980,20 @@ async function syncLatestDrops() {
             const name = attributes.name || "Unknown Album";
             const artist = attributes.artistName || "Unknown Artist";
             const key = getAlbumKey(name, artist);
-            if (seenIds.has(id) || seenKeys.has(key)) continue;
+            const isExplicit = attributes.contentRating === "explicit";
+            if (seenIds.has(id)) continue;
+            if (seenKeys.has(key)) {
+              // Same album already listed. If this copy is the explicit one and
+              // the earlier copy is the clean one, swap in the explicit version.
+              const existing = candidates.find((c) => getAlbumKey(c.name, c.artist) === key);
+              if (existing && isExplicit && !existing.explicit) {
+                Object.assign(existing, { id, name, artist, coverUrl, genres: attributes.genreNames || [genreName], releaseDateStr, originalReleaseTime: releaseDateObj.getTime(), explicit: true });
+                seenIds.add(id);
+              }
+              continue;
+            }
 
-            candidates.push({ id, name, artist, coverUrl, genres: attributes.genreNames || [genreName], releaseDateStr, originalReleaseTime: releaseDateObj.getTime() });
+            candidates.push({ id, name, artist, coverUrl, genres: attributes.genreNames || [genreName], releaseDateStr, originalReleaseTime: releaseDateObj.getTime(), explicit: isExplicit });
             seenIds.add(id);
             seenKeys.add(key);
           }
@@ -2004,7 +2020,8 @@ async function syncLatestDrops() {
               coverUrl: c.coverUrl,
               genres: c.genres,
               releaseDate: c.releaseDateStr,
-              originalReleaseTime: c.originalReleaseTime
+              originalReleaseTime: c.originalReleaseTime,
+              explicit: !!c.explicit
             });
           }
           console.log(`[Chart Filter] ${genreName}: ${fetchedAlbums.length} total survived after established-artist check (this genre's cumulative count).`);
@@ -2091,7 +2108,8 @@ async function syncLatestDrops() {
             coverUrl,
             genres: itemGenres.length > 0 ? itemGenres : [genreName],
             releaseDate: item.releaseDate,
-            originalReleaseTime: releaseDateObj.getTime()
+            originalReleaseTime: releaseDateObj.getTime(),
+            explicit: String(item.contentAdvisoryRating || "").toLowerCase() === "explicit"
           });
           seenIds.add(id);
           seenKeys.add(key);
@@ -2323,7 +2341,8 @@ async function syncLatestDrops() {
         timeAgo,
         averageRating: parseFloat((4.2 + Math.random() * 0.7).toFixed(1)),
         reviewCount: Math.floor(40 + Math.random() * 410),
-        originalReleaseTime: album.originalReleaseTime
+        originalReleaseTime: album.originalReleaseTime,
+        explicit: !!album.explicit
       };
     });
 
@@ -2423,6 +2442,7 @@ async function syncLatestDrops() {
                 averageRating: 0,
                 reviewCount: 0,
                 originalReleaseTime: releaseTime,
+                explicit: attrs.contentRating === "explicit",
               });
               existingIds.add(fallbackId);
               existingKeys.add(fallbackKey);
@@ -2476,6 +2496,20 @@ async function syncLatestDrops() {
       if (!mergedIds.has(album.id)) {
         processedAlbums.push(album);
         mergedIds.add(album.id);
+      }
+    }
+    // One entry per album: if a clean and an explicit version both made it in
+    // (different ids), keep only the explicit one.
+    {
+      const byKey = new Map<string, any>();
+      for (const a of processedAlbums) {
+        const k = getAlbumKey(a.name, a.artist);
+        const prev = byKey.get(k);
+        if (!prev || (a.explicit && !prev.explicit)) byKey.set(k, a);
+      }
+      const keep = new Set(byKey.values());
+      for (let i = processedAlbums.length - 1; i >= 0; i--) {
+        if (!keep.has(processedAlbums[i])) processedAlbums.splice(i, 1);
       }
     }
     // Purge blocked artists from everything (including carried-over cache)
@@ -2809,6 +2843,7 @@ app.get("/api/artists/:id", async (req, res) => {
                 coverUrl,
                 releaseYear: item.attributes?.releaseDate ? item.attributes.releaseDate.split("-")[0] : "N/A",
                 genres: item.attributes?.genreNames || ["Music"],
+                explicit: item.attributes?.contentRating === "explicit",
                 type: trackCount <= 1 ? "single" : "album"
               };
               // A real release with 1 track (or Apple not reporting a count)
@@ -2875,6 +2910,7 @@ app.get("/api/artists/:id", async (req, res) => {
           coverUrl: highResArt,
           releaseYear: item.releaseDate ? item.releaseDate.split("-")[0] : "N/A",
           genres: item.primaryGenreName ? [item.primaryGenreName] : ["Music"],
+          explicit: item.collectionExplicitness === "explicit",
           type: "album"
         };
       });
@@ -2892,6 +2928,7 @@ app.get("/api/artists/:id", async (req, res) => {
           coverUrl: highResArt,
           releaseYear: item.releaseDate ? item.releaseDate.split("-")[0] : "N/A",
           genres: item.primaryGenreName ? [item.primaryGenreName] : ["Music"],
+          explicit: item.trackExplicitness === "explicit",
           type: "song"
         };
       });
@@ -4267,6 +4304,56 @@ app.patch("/api/profile", requireAuth, async (req: AuthedRequest, res) => {
 // This endpoint computes the true, global average by scanning every user's
 // diary for the requested albums, so scores reflect everyone who's actually
 // reviewed the album — not just whatever the client happens to already know.
+// Popular this week: albums reviewed by the most distinct people recently.
+// Ranked by distinct reviewers (not total logs), ties broken by average
+// rating. Looks back 7 days and widens to 30 if the week is too quiet.
+let popularThisWeekCache: { at: number; albums: any[] } | null = null;
+app.get("/api/popular-this-week", requireAuth, async (_req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    if (popularThisWeekCache && Date.now() - popularThisWeekCache.at < 5 * 60 * 1000) {
+      res.json({ albums: popularThisWeekCache.albums });
+      return;
+    }
+    const run = async (days: number) => {
+      const r = await pool!.query(
+        `select entry->'album' as album,
+                count(distinct u.id) as reviewers,
+                avg(case when (entry->>'rating') ~ '^[0-9.]+$' then (entry->>'rating')::numeric end) as avg_rating
+         from users u, jsonb_array_elements(coalesce(u.sync_data->'diary', '[]'::jsonb)) as entry
+         where entry->'album'->>'id' is not null
+           and (entry->>'createdAt') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
+           and left(entry->>'createdAt', 10)::date >= current_date - $1::int
+         group by entry->'album', entry->'album'->>'id'
+         order by reviewers desc, avg_rating desc nulls last
+         limit 40`,
+        [days]
+      );
+      // Same album can appear with slightly different JSON; keep the top row per album id.
+      const seen = new Set<string>();
+      const out: any[] = [];
+      for (const row of r.rows) {
+        const alb = row.album || {};
+        if (!alb.id || seen.has(String(alb.id))) continue;
+        seen.add(String(alb.id));
+        out.push({ ...alb, reviewerCount: parseInt(row.reviewers, 10) });
+        if (out.length >= 10) break;
+      }
+      return out;
+    };
+    let albums = await run(7);
+    if (albums.length < 3) albums = await run(30);
+    popularThisWeekCache = { at: Date.now(), albums };
+    res.json({ albums });
+  } catch (error: any) {
+    console.error("Popular this week error:", error);
+    res.status(500).json({ error: "Failed to load popular albums", details: error.message });
+  }
+});
+
 app.post("/api/album-ratings", requireAuth, async (req: AuthedRequest, res) => {
   if (!accountsAvailable()) {
     res.status(503).json({ error: "Accounts are not configured on this server yet." });
