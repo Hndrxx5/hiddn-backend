@@ -1001,6 +1001,68 @@ async function searchAppleMusicCatalog({
 }
 
 // 1. Search Albums via Apple Music Catalog or fallback iTunes Search API
+// Look up explicit flags for a batch of Apple album ids. Used by the client to
+// fill in the "E" badge for albums that were saved before the flag existed
+// (or saved with a wrong value). Public + cached; only returns booleans.
+const explicitStatusCache = new Map<string, { v: boolean; t: number }>();
+app.get("/api/explicit-status", async (req, res) => {
+  try {
+    const ids = String(req.query.ids || "")
+      .split(",")
+      .map((x) => x.trim())
+      .filter((x) => /^\d{3,20}$/.test(x))
+      .slice(0, 100);
+    const out: Record<string, boolean> = {};
+    const now = Date.now();
+    const todo: string[] = [];
+    for (const id of ids) {
+      const c = explicitStatusCache.get(id);
+      if (c && now - c.t < 7 * 24 * 3600 * 1000) out[id] = c.v;
+      else todo.push(id);
+    }
+    if (todo.length) {
+      const found = new Set<string>();
+      const developerToken = process.env.APPLE_DEVELOPER_TOKEN;
+      if (developerToken) {
+        try {
+          const r1 = await fetch(`https://api.music.apple.com/v1/catalog/us/albums?ids=${todo.join(",")}`, {
+            headers: { Authorization: `Bearer ${developerToken}` },
+          });
+          if (r1.ok) {
+            const d: any = await r1.json();
+            for (const item of d?.data || []) {
+              const id = String(item.id);
+              const v = item.attributes?.contentRating === "explicit";
+              out[id] = v;
+              found.add(id);
+              explicitStatusCache.set(id, { v, t: now });
+            }
+          }
+        } catch {}
+      }
+      const rest = todo.filter((id) => !found.has(id));
+      if (rest.length) {
+        try {
+          const r2 = await fetch(`https://itunes.apple.com/lookup?id=${rest.join(",")}`);
+          if (r2.ok) {
+            const d: any = await r2.json();
+            for (const item of d?.results || []) {
+              if (item.wrapperType !== "collection") continue;
+              const id = String(item.collectionId);
+              const v = item.collectionExplicitness === "explicit";
+              out[id] = v;
+              explicitStatusCache.set(id, { v, t: now });
+            }
+          }
+        } catch {}
+      }
+    }
+    res.json({ statuses: out });
+  } catch (e) {
+    res.json({ statuses: {} });
+  }
+});
+
 app.get("/api/search", async (req, res) => {
   const query = req.query.q as string;
   const limitVal = req.query.limit ? parseInt(req.query.limit as string, 10) : 25;
