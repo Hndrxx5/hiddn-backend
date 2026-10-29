@@ -3357,6 +3357,7 @@ app.post("/api/delete-account", authRateLimiter, requireAuth, async (req: Authed
 
     // password_reset_tokens rows for this user are removed automatically
     // via the "on delete cascade" foreign key set up in the schema.
+    await pool!.query("delete from apple_music_connections where user_id = $1", [req.userId]).catch(() => {});
     await pool!.query("delete from users where id = $1", [req.userId]);
 
     sendEmail(
@@ -4963,7 +4964,257 @@ app.get("/support", (req, res) => {
 });
 
 
+
+// ---- Apple Music "log it" reminders --------------------------------------
+// People opt in from Settings. The app hands us a MusicKit user token; every
+// couple of hours we look at their recently played albums, and if one has been
+// sitting there a while and they haven't logged it, we send ONE push (max one
+// per day, never during quiet hours). Tokens starting with SIMULATOR_FAKE are
+// produced by the iOS Simulator (which has no Apple Music) and use sample data.
+const AM_FAKE_PREFIX = "SIMULATOR_FAKE";
+type AmAlbum = { id: string; name: string; artist: string; coverUrl: string; year: string };
+
+async function amEnsureTable() {
+  if (!pool) return;
+  await pool.query(`
+    create table if not exists apple_music_connections (
+      user_id text primary key,
+      music_user_token text not null,
+      reminders_enabled boolean not null default true,
+      tz_offset_minutes integer not null default 0,
+      seen jsonb not null default '{}'::jsonb,
+      nudged text[] not null default '{}',
+      last_nudge_at timestamptz,
+      last_checked_at timestamptz,
+      connected_at timestamptz not null default now()
+    )
+  `);
+}
+
+function amArtwork(url: any, size = 400): string {
+  return String(url || "").replace("{w}", String(size)).replace("{h}", String(size));
+}
+
+async function amFakeAlbums(): Promise<AmAlbum[]> {
+  // Sample data for the Simulator: a real catalog album so the album page opens.
+  try {
+    const r = await fetch("https://itunes.apple.com/lookup?id=1146195596&entity=album");
+    const d: any = await r.json();
+    const a = (d.results || []).find((x: any) => x.collectionId);
+    if (a) {
+      return [{
+        id: String(a.collectionId),
+        name: String(a.collectionName).replace(/ - (Single|EP)$/i, ""),
+        artist: String(a.artistName),
+        coverUrl: String(a.artworkUrl100 || "").replace("100x100", "600x600"),
+        year: String(a.releaseDate || "").slice(0, 4),
+      }];
+    }
+  } catch {}
+  return [{ id: "1146195596", name: "Blonde", artist: "Frank Ocean", coverUrl: "", year: "2016" }];
+}
+
+async function amRecentAlbums(musicUserToken: string): Promise<AmAlbum[]> {
+  if (musicUserToken.startsWith(AM_FAKE_PREFIX)) return amFakeAlbums();
+  const dev = process.env.APPLE_DEVELOPER_TOKEN || process.env.APPLE_MUSIC_JWT;
+  if (!dev) throw new Error("no_developer_token");
+  const r = await fetch("https://api.music.apple.com/v1/me/recent/played?limit=10", {
+    headers: { Authorization: `Bearer ${dev}`, "Music-User-Token": musicUserToken },
+  });
+  if (r.status === 401 || r.status === 403) throw Object.assign(new Error("token_rejected"), { code: "token_rejected" });
+  if (!r.ok) throw new Error(`apple_${r.status}`);
+  const d: any = await r.json();
+  return (d.data || [])
+    .filter((x: any) => x.type === "albums" && /^\d+$/.test(String(x.id)))
+    .map((x: any) => ({
+      id: String(x.id),
+      name: String(x.attributes?.name || "").replace(/ - (Single|EP)$/i, ""),
+      artist: String(x.attributes?.artistName || ""),
+      coverUrl: amArtwork(x.attributes?.artwork?.url),
+      year: String(x.attributes?.releaseDate || "").slice(0, 4),
+    }))
+    .filter((a: AmAlbum) => a.name);
+}
+
+function amNorm(s: string) {
+  return s.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+async function amLoggedKeys(userId: string): Promise<{ ids: Set<string>; names: Set<string> }> {
+  const ids = new Set<string>();
+  const names = new Set<string>();
+  const r = await pool!.query("select sync_data from users where id = $1", [userId]);
+  const diary = r.rows[0]?.sync_data && Array.isArray(r.rows[0].sync_data.diary) ? r.rows[0].sync_data.diary : [];
+  for (const e of diary) {
+    if (!e?.album) continue;
+    if (e.album.id) ids.add(String(e.album.id));
+    names.add(amNorm(`${e.album.name || ""}${e.album.artist || ""}`));
+  }
+  return { ids, names };
+}
+
+function amIsQuietHour(tzOffsetMinutes: number): boolean {
+  // JS getTimezoneOffset(): minutes BEHIND UTC (Chicago summer = 300).
+  const localMinutes = (((Date.now() / 60000 - tzOffsetMinutes) % 1440) + 1440) % 1440;
+  const hour = Math.floor(localMinutes / 60);
+  return hour >= 22 || hour < 9;
+}
+
+// Check one user. force=true (test endpoint) ignores quiet hours, the daily cap,
+// the "wait a couple of hours" rule and already-nudged albums.
+async function amCheckUser(userId: string, force = false): Promise<{ sent: boolean; album?: AmAlbum; reason?: string }> {
+  const rowRes = await pool!.query("select * from apple_music_connections where user_id = $1", [userId]);
+  const row = rowRes.rows[0];
+  if (!row) return { sent: false, reason: "not_connected" };
+  if (!row.reminders_enabled && !force) return { sent: false, reason: "reminders_off" };
+
+  let recent: AmAlbum[];
+  try {
+    recent = await amRecentAlbums(row.music_user_token);
+  } catch (err: any) {
+    if (err?.code === "token_rejected") {
+      await pool!.query("delete from apple_music_connections where user_id = $1", [userId]);
+      return { sent: false, reason: "token_rejected" };
+    }
+    return { sent: false, reason: err?.message || "apple_error" };
+  }
+
+  const now = Date.now();
+  const seen: Record<string, number> = { ...(row.seen || {}) };
+  const nudged: string[] = row.nudged || [];
+  const recentIds = new Set(recent.map((a) => a.id));
+  for (const a of recent) if (!seen[a.id]) seen[a.id] = now;
+  for (const id of Object.keys(seen)) if (!recentIds.has(id)) delete seen[id];
+  await pool!.query("update apple_music_connections set seen = $2::jsonb, last_checked_at = now() where user_id = $1", [userId, JSON.stringify(seen)]);
+
+  if (!force) {
+    if (amIsQuietHour(row.tz_offset_minutes || 0)) return { sent: false, reason: "quiet_hours" };
+    if (row.last_nudge_at && now - new Date(row.last_nudge_at).getTime() < 20 * 3600 * 1000) return { sent: false, reason: "daily_cap" };
+  }
+
+  const logged = await amLoggedKeys(userId);
+  const candidate = recent.find((a) => {
+    if (logged.ids.has(a.id) || logged.names.has(amNorm(`${a.name}${a.artist}`))) return false;
+    if (force) return true;
+    if (nudged.includes(a.id)) return false;
+    return now - (seen[a.id] || now) >= 2 * 3600 * 1000;
+  });
+  if (!candidate) return { sent: false, reason: "nothing_to_log" };
+
+  await pushToUser(
+    userId,
+    "Log your listen",
+    `Just finished ${candidate.name}? Give it a rating while it's fresh.`,
+    { type: "log_album", albumId: candidate.id, name: candidate.name, artist: candidate.artist, coverUrl: candidate.coverUrl, year: candidate.year }
+  );
+  await pool!.query(
+    "update apple_music_connections set last_nudge_at = now(), nudged = (select array(select distinct unnest(nudged || $2::text[]))) where user_id = $1",
+    [userId, [candidate.id]]
+  );
+  return { sent: true, album: candidate };
+}
+
+async function amRunAll() {
+  if (!pool) return;
+  try {
+    const r = await pool.query("select user_id from apple_music_connections where reminders_enabled = true");
+    for (const row of r.rows) {
+      try {
+        await amCheckUser(row.user_id);
+      } catch (err: any) {
+        console.error("[AM] check failed for a user:", err?.message);
+      }
+    }
+  } catch (err: any) {
+    console.error("[AM] run failed:", err?.message);
+  }
+}
+
+app.get("/api/applemusic/status", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const r = await pool!.query("select reminders_enabled, last_checked_at from apple_music_connections where user_id = $1", [req.userId]);
+    const row = r.rows[0];
+    res.json({ connected: !!row, remindersEnabled: row ? !!row.reminders_enabled : false, lastCheckedAt: row?.last_checked_at || null });
+  } catch {
+    res.json({ connected: false, remindersEnabled: false, lastCheckedAt: null });
+  }
+});
+
+// The Apple Music developer token is meant to be shipped to clients (MusicKit does this too);
+// the app needs it once to ask iOS for the user's music token.
+app.get("/api/applemusic/developer-token", requireAuth, (_req: AuthedRequest, res) => {
+  res.json({ developerToken: process.env.APPLE_DEVELOPER_TOKEN || process.env.APPLE_MUSIC_JWT || "" });
+});
+
+app.post("/api/applemusic/connect", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const token = String(req.body?.musicUserToken || "").trim();
+    if (!token || token.length > 4000) return res.status(400).json({ error: "A valid Apple Music token is required." });
+    const tz = Math.max(-840, Math.min(840, parseInt(String(req.body?.tzOffsetMinutes ?? 0), 10) || 0));
+    // Start from "what's already in their history" so we only ever nudge about
+    // listening that happens AFTER they connect.
+    let seen: Record<string, number> = {};
+    let nudged: string[] = [];
+    if (!token.startsWith(AM_FAKE_PREFIX)) {
+      try {
+        const recent = await amRecentAlbums(token);
+        nudged = recent.map((a) => a.id);
+        for (const a of recent) seen[a.id] = Date.now();
+      } catch (err: any) {
+        return res.status(400).json({ error: "Apple Music didn't accept the connection. Make sure you have an active Apple Music subscription." });
+      }
+    }
+    await pool!.query(
+      `insert into apple_music_connections (user_id, music_user_token, reminders_enabled, tz_offset_minutes, seen, nudged)
+       values ($1, $2, true, $3, $4::jsonb, $5::text[])
+       on conflict (user_id) do update set music_user_token = excluded.music_user_token, reminders_enabled = true,
+         tz_offset_minutes = excluded.tz_offset_minutes, seen = excluded.seen, nudged = excluded.nudged, connected_at = now()`,
+      [req.userId, token, tz, JSON.stringify(seen), nudged]
+    );
+    res.json({ connected: true, remindersEnabled: true });
+  } catch (err: any) {
+    console.error("[AM] connect error:", err?.message);
+    res.status(500).json({ error: "Could not connect Apple Music." });
+  }
+});
+
+app.post("/api/applemusic/settings", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const enabled = !!req.body?.remindersEnabled;
+    const r = await pool!.query("update apple_music_connections set reminders_enabled = $2 where user_id = $1", [req.userId, enabled]);
+    if (!r.rowCount) return res.status(404).json({ error: "Apple Music isn't connected." });
+    res.json({ remindersEnabled: enabled });
+  } catch {
+    res.status(500).json({ error: "Could not update settings." });
+  }
+});
+
+app.post("/api/applemusic/disconnect", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    await pool!.query("delete from apple_music_connections where user_id = $1", [req.userId]);
+    res.json({ connected: false });
+  } catch {
+    res.status(500).json({ error: "Could not disconnect." });
+  }
+});
+
+// For testing: run the check for ME right now (ignores quiet hours / daily cap / wait time).
+app.post("/api/applemusic/test-run", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    res.json(await amCheckUser(req.userId!, true));
+  } catch (err: any) {
+    res.status(500).json({ sent: false, reason: err?.message || "error" });
+  }
+});
+
 async function startServer() {
+  if (pool) {
+    try {
+      await amEnsureTable();
+    } catch (err: any) {
+      console.error("Failed to ensure apple_music_connections table exists:", err.message);
+    }
+  }
   if (pool) {
     try {
       await pool.query(`
@@ -5024,6 +5275,9 @@ async function startServer() {
     };
     cleanupOldNotifications();
     setInterval(cleanupOldNotifications, 24 * 60 * 60 * 1000);
+
+    // Apple Music "log it" reminders: check opted-in listeners every 2 hours.
+    setInterval(amRunAll, 2 * 60 * 60 * 1000);
 
     // Schedule automatic music sync every 3 hours
     setInterval(async () => {
