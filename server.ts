@@ -1001,6 +1001,63 @@ async function searchAppleMusicCatalog({
 }
 
 // 1. Search Albums via Apple Music Catalog or fallback iTunes Search API
+// ---- GIF search (GIPHY proxy) -------------------------------------------
+// The API key stays on the server (env GIPHY_API_KEY). Results are filtered to
+// PG-13 and cached briefly. Only returns the fields the app needs.
+const gifCache = new Map<string, { t: number; data: any[] }>();
+async function giphyList(kind: "trending" | "search", q: string) {
+  const key = process.env.GIPHY_API_KEY;
+  if (!key) return { configured: false, results: [] as any[] };
+  const ck = `${kind}:${q.toLowerCase()}`;
+  const hit = gifCache.get(ck);
+  if (hit && Date.now() - hit.t < 60_000) return { configured: true, results: hit.data };
+  const url =
+    kind === "search"
+      ? `https://api.giphy.com/v1/gifs/search?api_key=${encodeURIComponent(key)}&q=${encodeURIComponent(q)}&limit=24&rating=pg-13&lang=en`
+      : `https://api.giphy.com/v1/gifs/trending?api_key=${encodeURIComponent(key)}&limit=24&rating=pg-13`;
+  const r = await fetch(url);
+  if (!r.ok) return { configured: true, results: [] as any[] };
+  const d: any = await r.json();
+  const results = (d?.data || [])
+    .map((g: any) => ({
+      id: String(g.id),
+      preview: String(g.images?.fixed_width_small?.url || g.images?.fixed_width?.url || "").split("?")[0],
+      url: String(g.images?.fixed_width?.url || "").split("?")[0],
+      w: Number(g.images?.fixed_width?.width) || 200,
+      h: Number(g.images?.fixed_width?.height) || 150,
+    }))
+    .filter((g: any) => g.url && g.preview);
+  gifCache.set(ck, { t: Date.now(), data: results });
+  if (gifCache.size > 300) gifCache.clear();
+  return { configured: true, results };
+}
+app.get("/api/gifs/trending", requireAuth, async (_req: AuthedRequest, res) => {
+  try {
+    res.json(await giphyList("trending", ""));
+  } catch {
+    res.json({ configured: true, results: [] });
+  }
+});
+app.get("/api/gifs/search", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const q = String(req.query.q || "").trim().slice(0, 60);
+    if (!q) return res.json(await giphyList("trending", ""));
+    if (containsObjectionableContent(q)) return res.json({ configured: true, results: [] });
+    res.json(await giphyList("search", q));
+  } catch {
+    res.json({ configured: true, results: [] });
+  }
+});
+// A comment's text may carry one GIF as a trailing marker: "\n[[gif:<url>]]".
+const GIF_URL_RE = /^https:\/\/media\d*\.giphy\.com\/[A-Za-z0-9_\-\/\.%=]+$/;
+const GIF_MARKER_RE = /\n?\[\[gif:[^\]\s]+\]\]/g;
+function commentPreview(text: string): string {
+  const hadGif = GIF_MARKER_RE.test(text);
+  GIF_MARKER_RE.lastIndex = 0;
+  const plain = text.replace(GIF_MARKER_RE, "").trim();
+  return plain ? (hadGif ? `${plain} [GIF]` : plain) : "sent a GIF";
+}
+
 // Look up explicit flags for a batch of Apple album ids. Used by the client to
 // fill in the "E" badge for albums that were saved before the flag existed
 // (or saved with a wrong value). Public + cached; only returns booleans.
@@ -3829,16 +3886,23 @@ app.post("/api/comments", requireAuth, async (req: AuthedRequest, res) => {
   }
   try {
     const reviewId = String(req.body?.reviewId || "").trim();
-    const text = String(req.body?.text || "").trim().slice(0, 1000);
+    let text = String(req.body?.text || "").replace(GIF_MARKER_RE, "").trim().slice(0, 900);
+    GIF_MARKER_RE.lastIndex = 0;
+    const gifUrl = req.body?.gifUrl ? String(req.body.gifUrl).trim().split("?")[0] : "";
     const parentCommentId = req.body?.parentCommentId ? String(req.body.parentCommentId).trim() : null;
-    if (!reviewId || !text) {
+    if (gifUrl && !GIF_URL_RE.test(gifUrl)) {
+      res.status(400).json({ error: "Invalid GIF." });
+      return;
+    }
+    if (!reviewId || (!text && !gifUrl)) {
       res.status(400).json({ error: "reviewId and text are required." });
       return;
     }
-    if (containsObjectionableContent(text)) {
+    if (text && containsObjectionableContent(text)) {
       res.status(400).json({ error: "This comment contains language that isn't allowed on hiddn." });
       return;
     }
+    if (gifUrl) text = `${text}\n[[gif:${gifUrl}]]`.trim();
 
     const insertResult = await pool!.query(
       "insert into review_comments (user_id, review_id, text, parent_comment_id) values ($1, $2, $3, $4) returning id, created_at",
@@ -3877,7 +3941,7 @@ app.post("/api/comments", requireAuth, async (req: AuthedRequest, res) => {
         [ownerRow.id, req.userId, reviewEntry && reviewEntry.album ? JSON.stringify(reviewEntry.album) : null, reviewId, insertResult.rows[0].id]
       );
       const albumName = reviewEntry && reviewEntry.album ? reviewEntry.album.name : "your review";
-      pushToUser(ownerRow.id, "New Comment", `${commenter.username} commented on your review of ${albumName}: "${text.slice(0, 80)}"`, {
+      pushToUser(ownerRow.id, "New Comment", `${commenter.username} commented on your review of ${albumName}: "${commentPreview(text).slice(0, 80)}"`, {
         type: "comment",
         reviewId,
         commentId: String(insertResult.rows[0].id),
@@ -3901,7 +3965,7 @@ app.post("/api/comments", requireAuth, async (req: AuthedRequest, res) => {
             "insert into notifications (user_id, type, from_user_id, album_data, review_id, comment_id) values ($1, 'reply', $2, $3, $4, $5)",
             [parentAuthorId, req.userId, reviewEntry && reviewEntry.album ? JSON.stringify(reviewEntry.album) : null, reviewId, insertResult.rows[0].id]
           );
-          pushToUser(parentAuthorId, "New Reply", `${commenter.username} replied to your comment: "${text.slice(0, 80)}"`, {
+          pushToUser(parentAuthorId, "New Reply", `${commenter.username} replied to your comment: "${commentPreview(text).slice(0, 80)}"`, {
             type: "reply",
             reviewId,
             commentId: String(insertResult.rows[0].id),
