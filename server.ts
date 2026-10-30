@@ -4268,6 +4268,28 @@ app.get("/api/users/:email", requireAuth, async (req: AuthedRequest, res) => {
     const actualCollections = (row.sync_data && Array.isArray(row.sync_data.collections)) ? row.sync_data.collections : [];
     console.log(`[USER LOOKUP] ${email}: returning ${actualReviews.length} reviews, ${actualCollections.length} collections. Raw sync_data.diary type: ${typeof row.sync_data?.diary}, isArray: ${Array.isArray(row.sync_data?.diary)}`);
 
+    // Attach like counts and whether the viewer liked each review, so a profile's
+    // reviews match what the community feed shows.
+    const profileReviewIds = actualReviews.map((e: any) => e && e.id).filter(Boolean);
+    if (profileReviewIds.length > 0) {
+      const pLikeCounts = await pool!.query(
+        "select review_id, count(*) as count from review_likes where review_id = any($1) group by review_id",
+        [profileReviewIds]
+      );
+      const pViewerLikes = await pool!.query(
+        "select review_id from review_likes where user_id = $1 and review_id = any($2)",
+        [req.userId, profileReviewIds]
+      );
+      const pCountMap = new Map(pLikeCounts.rows.map((r: any) => [r.review_id, parseInt(r.count, 10)]));
+      const pLikedSet = new Set(pViewerLikes.rows.map((r: any) => r.review_id));
+      for (let idx = 0; idx < actualReviews.length; idx++) {
+        const e = actualReviews[idx];
+        if (e && e.id) {
+          actualReviews[idx] = { ...e, likes: pCountMap.get(e.id) || 0, likedByUser: pLikedSet.has(e.id) };
+        }
+      }
+    }
+
     res.json({
       user: {
         ...toPublicUser(row),
