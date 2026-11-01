@@ -5040,22 +5040,71 @@ async function amRecentAlbums(musicUserToken: string): Promise<AmAlbum[]> {
   if (musicUserToken.startsWith(AM_FAKE_PREFIX)) return amFakeAlbums();
   const dev = process.env.APPLE_DEVELOPER_TOKEN || process.env.APPLE_MUSIC_JWT;
   if (!dev) throw new Error("no_developer_token");
-  const r = await fetch("https://api.music.apple.com/v1/me/recent/played?limit=10", {
-    headers: { Authorization: `Bearer ${dev}`, "Music-User-Token": musicUserToken },
-  });
+  const headers = { Authorization: `Bearer ${dev}`, "Music-User-Token": musicUserToken };
+  const clean = (n: any) => String(n || "").replace(/ - (Single|EP)$/i, "");
+  const out: AmAlbum[] = [];
+  const have = new Set<string>();
+
+  // 1) Individual songs: any song played counts, even a single track from an album.
+  const tr = await fetch("https://api.music.apple.com/v1/me/recent/played/tracks?types=songs&limit=30&include=albums", { headers });
+  if (tr.status === 401 || tr.status === 403) throw Object.assign(new Error("token_rejected"), { code: "token_rejected" });
+  if (tr.ok) {
+    const td: any = await tr.json();
+    for (const x of td.data || []) {
+      const rel = x.relationships?.albums?.data?.[0];
+      const attrs = x.attributes || {};
+      const albumName = clean(attrs.albumName);
+      if (!albumName) continue;
+      let id = rel && /^\d+$/.test(String(rel.id)) ? String(rel.id) : "";
+      if (!id) {
+        // No album link on the song: look the album up so the notification can open it.
+        try {
+          const lr = await fetch(`https://itunes.apple.com/search?term=${encodeURIComponent(albumName + " " + (attrs.artistName || ""))}&entity=album&limit=1`);
+          const ld: any = await lr.json();
+          const hit = (ld.results || [])[0];
+          if (hit && hit.collectionId) id = String(hit.collectionId);
+        } catch {}
+      }
+      if (!id) continue;
+      if (have.has(id)) continue;
+      have.add(id);
+      out.push({
+        id,
+        name: albumName,
+        artist: String(attrs.artistName || ""),
+        coverUrl: amArtwork(attrs.artwork?.url),
+        year: String(attrs.releaseDate || "").slice(0, 4),
+      });
+    }
+  } else if (tr.status !== 404) {
+    throw new Error(`apple_${tr.status}`);
+  }
+
+  // 2) Whole albums played (kept so nothing from the old behavior is lost).
+  const r = await fetch("https://api.music.apple.com/v1/me/recent/played?limit=10", { headers });
   if (r.status === 401 || r.status === 403) throw Object.assign(new Error("token_rejected"), { code: "token_rejected" });
-  if (!r.ok) throw new Error(`apple_${r.status}`);
-  const d: any = await r.json();
-  return (d.data || [])
-    .filter((x: any) => x.type === "albums" && /^\d+$/.test(String(x.id)))
-    .map((x: any) => ({
-      id: String(x.id),
-      name: String(x.attributes?.name || "").replace(/ - (Single|EP)$/i, ""),
-      artist: String(x.attributes?.artistName || ""),
-      coverUrl: amArtwork(x.attributes?.artwork?.url),
-      year: String(x.attributes?.releaseDate || "").slice(0, 4),
-    }))
-    .filter((a: AmAlbum) => a.name);
+  if (r.ok) {
+    const d: any = await r.json();
+    for (const x of d.data || []) {
+      if (x.type !== "albums" || !/^\d+$/.test(String(x.id))) continue;
+      const id = String(x.id);
+      const name = clean(x.attributes?.name);
+      if (!name || have.has(id)) continue;
+      const key = amNorm(name + (x.attributes?.artistName || ""));
+      if (out.some((o) => amNorm(o.name + o.artist) === key)) continue;
+      have.add(id);
+      out.push({
+        id,
+        name,
+        artist: String(x.attributes?.artistName || ""),
+        coverUrl: amArtwork(x.attributes?.artwork?.url),
+        year: String(x.attributes?.releaseDate || "").slice(0, 4),
+      });
+    }
+  } else if (out.length === 0) {
+    throw new Error(`apple_${r.status}`);
+  }
+  return out;
 }
 
 function amNorm(s: string) {
@@ -5119,7 +5168,7 @@ async function amCheckUser(userId: string, force = false): Promise<{ sent: boole
     if (logged.ids.has(a.id) || logged.names.has(amNorm(`${a.name}${a.artist}`))) return false;
     if (force) return true;
     if (nudged.includes(a.id)) return false;
-    return now - (seen[a.id] || now) >= 2 * 3600 * 1000;
+    return now - (seen[a.id] || now) >= 60 * 60 * 1000;
   });
   if (!candidate) return { sent: false, reason: "nothing_to_log" };
 
@@ -5298,8 +5347,8 @@ async function startServer() {
     cleanupOldNotifications();
     setInterval(cleanupOldNotifications, 24 * 60 * 60 * 1000);
 
-    // Apple Music "log it" reminders: check opted-in listeners every 2 hours.
-    setInterval(amRunAll, 2 * 60 * 60 * 1000);
+    // Apple Music "log it" reminders: check opted-in listeners every 30 minutes.
+    setInterval(amRunAll, 30 * 60 * 1000);
 
     // Schedule automatic music sync every 3 hours
     setInterval(async () => {
