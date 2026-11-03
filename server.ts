@@ -4650,6 +4650,88 @@ app.get("/api/search-users", requireAuth, async (req: AuthedRequest, res) => {
 
 
 
+// Ranked "who to follow" list for the first-launch flow. The founder account is
+// always pinned first, then: taste match (shared albums), active this week,
+// top reviewers. Empty profiles and already-followed accounts are skipped.
+const FOUNDER_USERNAME = "charlesxhendrix";
+app.get("/api/suggested-follows", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const limit = Math.max(1, Math.min(10, parseInt(String(req.query.limit || "5"), 10) || 5));
+    const mineIds = new Set<string>(
+      String(req.query.albumIds || "").split(",").map((x) => x.trim()).filter(Boolean)
+    );
+    const genres = String(req.query.genres || "").toLowerCase().split(",").map((x) => x.trim()).filter(Boolean);
+    const result = await pool!.query(
+      `select u.id, u.email, u.username, u.bio, u.avatar_url, u.sync_data
+       from users u
+       where u.id != $1
+         and not exists (select 1 from follows f where f.follower_id = $1 and f.followed_id = u.id)
+       order by u.created_at desc
+       limit 500`,
+      [req.userId]
+    );
+    const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const scored: any[] = [];
+    let founder: any = null;
+    for (const r of result.rows) {
+      const diary: any[] = r.sync_data && Array.isArray(r.sync_data.diary) ? r.sync_data.diary : [];
+      const favs: any[] = r.sync_data && Array.isArray(r.sync_data.favorites) ? r.sync_data.favorites : [];
+      const isFounder = String(r.username || "").toLowerCase() === FOUNDER_USERNAME;
+      if (diary.length === 0 && !isFounder) continue;
+      let shared = 0;
+      let recent = 0;
+      const coverPool: string[] = [];
+      for (const e of diary) {
+        if (e && e.album && e.album.id && mineIds.has(String(e.album.id))) shared++;
+        const t = new Date((e && (e.createdAt || e.listenedAt)) || 0).getTime();
+        if (t && t >= weekAgo) recent++;
+      }
+      for (const f of favs) { if (f && f.coverUrl) coverPool.push(f.coverUrl); }
+      for (const e of diary) {
+        if (coverPool.length >= 3) break;
+        if (e && e.album && e.album.coverUrl && !coverPool.includes(e.album.coverUrl)) coverPool.push(e.album.coverUrl);
+      }
+      let genreHit = "";
+      if (genres.length) {
+        for (const e of diary) {
+          const g = ((e && e.album && e.album.genres) || []).map((x: any) => String(x).toLowerCase());
+          const m = genres.find((gg) => g.some((x: string) => x.includes(gg)));
+          if (m) { genreHit = m; break; }
+        }
+      }
+      let reason = "Top reviewer";
+      let score = diary.length;
+      if (shared > 0) { reason = shared === 1 ? "1 album in common" : shared + " albums in common"; score += 1000 * shared; }
+      else if (genreHit) { reason = "Rates " + genreHit + " like you"; score += 500; }
+      else if (recent > 0) { reason = recent === 1 ? "1 review this week" : recent + " reviews this week"; score += 200 + recent; }
+      const row = {
+        id: r.email,
+        email: r.email,
+        username: r.username,
+        name: r.username,
+        avatarUrl: r.avatar_url || generateDefaultAvatar(r.email),
+        reason: isFounder ? "Founder" : reason,
+        isFounder,
+        covers: coverPool.slice(0, 3),
+        reviewCount: diary.length,
+        isFollowing: false,
+        _score: isFounder ? Number.MAX_SAFE_INTEGER : score,
+      };
+      if (isFounder) founder = row; else scored.push(row);
+    }
+    scored.sort((a, b) => b._score - a._score);
+    const picked = (founder ? [founder] : []).concat(scored).slice(0, limit);
+    res.json({ users: picked.map(({ _score, ...rest }: any) => rest) });
+  } catch (error: any) {
+    console.error("Suggested follows error:", error);
+    res.status(500).json({ error: "Failed to load suggestions", details: error.message });
+  }
+});
+
 app.get("/api/discover-users", requireAuth, async (req: AuthedRequest, res) => {
   if (!accountsAvailable()) {
     res.status(503).json({ error: "Accounts are not configured on this server yet." });
