@@ -4514,12 +4514,24 @@ app.post("/api/album-ratings", requireAuth, async (req: AuthedRequest, res) => {
       return;
     }
     const result = await pool!.query(
-      `select entry->'album'->>'id' as album_id,
-              avg((entry->>'rating')::numeric) as avg_rating,
+      // One rating per person per album: each user's most recent entry for the
+      // album counts, so re-logs don't inflate the count or skew the average,
+      // and entries without a numeric rating are ignored.
+      `select album_id,
+              avg(rating) as avg_rating,
               count(*) as review_count
-       from users, jsonb_array_elements(coalesce(sync_data->'diary', '[]'::jsonb)) as entry
-       where entry->'album'->>'id' = any($1::text[])
-       group by entry->'album'->>'id'`,
+       from (
+         select distinct on (u.id, entry->'album'->>'id')
+                entry->'album'->>'id' as album_id,
+                (entry->>'rating')::numeric as rating
+         from users u, jsonb_array_elements(coalesce(u.sync_data->'diary', '[]'::jsonb)) as entry
+         where entry->'album'->>'id' = any($1::text[])
+           and (entry->>'rating') ~ '^[0-9]+([.][0-9]+)?$'
+         order by u.id, entry->'album'->>'id',
+                  coalesce(entry->>'createdAt', '') desc,
+                  coalesce(entry->>'listenedAt', '') desc
+       ) latest
+       group by album_id`,
       [albumIds]
     );
     const ratings: Record<string, { averageRating: number; reviewCount: number }> = {};
