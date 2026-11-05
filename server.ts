@@ -2867,18 +2867,27 @@ app.get("/api/artists/:id", async (req, res) => {
         // runaway API calls.
         if (albumsData?.data && albumsData.data.length === 50) {
           let offset = 50;
-          const maxTotal = 300;
+          const maxTotal = 1500;
+          let failures = 0;
           while (albumsData.data.length < maxTotal) {
             const nextUrl = `https://api.music.apple.com/v1/catalog/${storefront}/artists/${cleanId}/albums?limit=50&offset=${offset}&sort=-releaseDate`;
             const nextRes = await fetch(nextUrl, { headers: { "Authorization": `Bearer ${developerToken}` } });
-            if (!nextRes.ok) break;
+            if (!nextRes.ok) {
+              // One flaky page shouldn't truncate the whole catalog — retry
+              // a couple of times before giving up.
+              if (++failures > 2) break;
+              continue;
+            }
             const nextData = await nextRes.json() as any;
             const nextItems = nextData?.data || [];
             if (nextItems.length === 0) break;
             albumsData.data = albumsData.data.concat(nextItems);
-            if (nextItems.length < 50) break; // reached the actual end
+            if (!nextData.next && nextItems.length < 50) break; // reached the actual end
             offset += 50;
           }
+          // De-duplicate in case pages overlap
+          const seenIds = new Set<string>();
+          albumsData.data = albumsData.data.filter((x: any) => !seenIds.has(x.id) && seenIds.add(x.id));
         }
 
         const artistItem = artistData.data?.[0];
@@ -5088,7 +5097,7 @@ app.get("/support", (req, res) => {
 // per day, never during quiet hours). Tokens starting with SIMULATOR_FAKE are
 // produced by the iOS Simulator (which has no Apple Music) and use sample data.
 const AM_FAKE_PREFIX = "SIMULATOR_FAKE";
-type AmAlbum = { id: string; name: string; artist: string; coverUrl: string; year: string };
+type AmAlbum = { id: string; name: string; artist: string; coverUrl: string; year: string; plays?: number };
 
 async function amEnsureTable() {
   if (!pool) return;
@@ -5160,7 +5169,12 @@ async function amRecentAlbums(musicUserToken: string): Promise<AmAlbum[]> {
         } catch {}
       }
       if (!id) continue;
-      if (have.has(id)) continue;
+      if (have.has(id)) {
+        // Another song from an album we already have: count it.
+        const existing = out.find((o) => o.id === id);
+        if (existing) existing.plays = (existing.plays || 1) + 1;
+        continue;
+      }
       have.add(id);
       out.push({
         id,
@@ -5168,6 +5182,7 @@ async function amRecentAlbums(musicUserToken: string): Promise<AmAlbum[]> {
         artist: String(attrs.artistName || ""),
         coverUrl: amArtwork(attrs.artwork?.url),
         year: String(attrs.releaseDate || "").slice(0, 4),
+        plays: 1,
       });
     }
   } else if (tr.status !== 404) {
@@ -5193,6 +5208,7 @@ async function amRecentAlbums(musicUserToken: string): Promise<AmAlbum[]> {
         artist: String(x.attributes?.artistName || ""),
         coverUrl: amArtwork(x.attributes?.artwork?.url),
         year: String(x.attributes?.releaseDate || "").slice(0, 4),
+        plays: 1,
       });
     }
   } else if (out.length === 0) {
@@ -5258,12 +5274,19 @@ async function amCheckUser(userId: string, force = false): Promise<{ sent: boole
   }
 
   const logged = await amLoggedKeys(userId);
-  const candidate = recent.find((a) => {
+  // Eligible = not logged, not already nudged, sitting there for an hour.
+  // Of those, remind about the album with the MOST songs played; ties go to
+  // the newest (recent[] is newest-first, so the first one seen wins a tie).
+  const eligible = recent.filter((a) => {
     if (logged.ids.has(a.id) || logged.names.has(amNorm(`${a.name}${a.artist}`))) return false;
     if (force) return true;
     if (nudged.includes(a.id)) return false;
     return now - (seen[a.id] || now) >= 60 * 60 * 1000;
   });
+  let candidate: AmAlbum | undefined;
+  for (const a of eligible) {
+    if (!candidate || (a.plays || 1) > (candidate.plays || 1)) candidate = a;
+  }
   if (!candidate) return { sent: false, reason: "nothing_to_log" };
 
   await pushToUser(
