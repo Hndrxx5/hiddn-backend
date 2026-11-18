@@ -2634,7 +2634,25 @@ app.get("/api/latest-drops", async (req, res) => {
     // album that was 3 days old when cached can quietly become 9 days old
     // by the time someone actually looks at it. Re-check against the real
     // current time here rather than trusting whatever was true at cache time.
-    const rawResults = latestDropsCache[cacheKey] || [];
+    let rawResults = latestDropsCache[cacheKey] || [];
+    // A genre tab is built from Apple's genre-specific chart, which can lag
+    // behind (or miss) a brand new release that already shows up in the
+    // All Genres feed. Fold in anything from All whose own genre tags match
+    // this tab, so a release can't appear in All but be missing from its
+    // own genre.
+    if (cacheKey !== "all") {
+      const tabGenreNames: Record<string, string> = {
+        "rock": "Rock", "alternative": "Alternative", "country": "Country",
+        "electronic": "Electronic", "hip-hop": "Hip-Hop/Rap", "pop": "Pop", "r&b": "R&B/Soul"
+      };
+      const wanted = (tabGenreNames[cacheKey] || "").toLowerCase();
+      const have = new Set(rawResults.map((a: any) => String(a.id)));
+      const extra = (latestDropsCache["all"] || []).filter((a: any) =>
+        wanted && !have.has(String(a.id)) &&
+        Array.isArray(a.genres) && a.genres.some((g: any) => String(g).toLowerCase() === wanted)
+      );
+      if (extra.length) rawResults = [...rawResults, ...extra];
+    }
     const nowMs = Date.now();
     const twentyOneDaysMs = 21 * 24 * 60 * 60 * 1000;
     const freshResults = rawResults
@@ -4554,6 +4572,113 @@ app.post("/api/album-ratings", requireAuth, async (req: AuthedRequest, res) => {
   } catch (error: any) {
     console.error("Fetch album ratings error:", error);
     res.status(500).json({ error: "Failed to load album ratings", details: error.message });
+  }
+});
+
+// Everyone who rated/reviewed one album: summary (average, count, 10-bucket
+// distribution) plus a list of reviews. One entry per person (their most recent
+// for the album). Blocked users (either direction) are left out.
+app.get("/api/album-reviews/:albumId", requireAuth, async (req: AuthedRequest, res) => {
+  if (!accountsAvailable()) {
+    res.status(503).json({ error: "Accounts are not configured on this server yet." });
+    return;
+  }
+  try {
+    const albumId = String(req.params.albumId || "").trim();
+    if (!albumId) {
+      res.status(400).json({ error: "albumId is required" });
+      return;
+    }
+    const rows = await pool!.query(
+      `select u.id as user_id, u.email, u.username, u.avatar_url, entry
+       from users u, jsonb_array_elements(coalesce(u.sync_data->'diary', '[]'::jsonb)) as entry
+       where entry->'album'->>'id' = $1
+         and (entry->>'rating') ~ '^[0-9]+([.][0-9]+)?$'
+         and not exists (
+           select 1 from blocks b
+           where (b.blocker_id = $2 and b.blocked_id = u.id)
+              or (b.blocker_id = u.id and b.blocked_id = $2)
+         )`,
+      [albumId, req.userId]
+    );
+
+    // Keep each person's most recent entry for this album.
+    const stamp = (e: any) => String((e && (e.createdAt || e.listenedAt)) || "");
+    const latestByUser = new Map<string, any>();
+    for (const row of rows.rows) {
+      const prev = latestByUser.get(String(row.user_id));
+      if (!prev || stamp(row.entry) > stamp(prev.entry)) latestByUser.set(String(row.user_id), row);
+    }
+    const picked = Array.from(latestByUser.values());
+
+    const distribution = new Array(10).fill(0);
+    let total = 0;
+    for (const row of picked) {
+      const r = parseFloat(row.entry.rating);
+      if (!isFinite(r)) continue;
+      total += r;
+      const idx = Math.min(9, Math.max(0, Math.round(r * 2) - 1));
+      distribution[idx] += 1;
+    }
+    const count = picked.length;
+    const averageRating = count > 0 ? Math.round((total / count) * 10) / 10 : 0;
+
+    const reviewIds = picked.map((r) => String(r.entry.id || "")).filter(Boolean);
+    const likeMap = new Map<string, number>();
+    const commentMap = new Map<string, number>();
+    const likedSet = new Set<string>();
+    if (reviewIds.length > 0) {
+      const likeCounts = await pool!.query(
+        "select review_id, count(*) as count from review_likes where review_id = any($1) group by review_id",
+        [reviewIds]
+      );
+      likeCounts.rows.forEach((r: any) => likeMap.set(r.review_id, parseInt(r.count, 10)));
+      const viewerLikes = await pool!.query(
+        "select review_id from review_likes where user_id = $1 and review_id = any($2)",
+        [req.userId, reviewIds]
+      );
+      viewerLikes.rows.forEach((r: any) => likedSet.add(r.review_id));
+      const commentCounts = await pool!.query(
+        "select review_id, count(*) as count from review_comments where review_id = any($1) group by review_id",
+        [reviewIds]
+      );
+      commentCounts.rows.forEach((r: any) => commentMap.set(r.review_id, parseInt(r.count, 10)));
+    }
+    const followed = await pool!.query("select followed_id from follows where follower_id = $1", [req.userId]);
+    const followedSet = new Set(followed.rows.map((r: any) => String(r.followed_id)));
+
+    const reviews = picked.map((row) => {
+      const e = row.entry;
+      const text = typeof e.reviewText === "string" ? e.reviewText.trim() : "";
+      return {
+        id: e.id,
+        rating: parseFloat(e.rating),
+        reviewText: text.slice(0, 2000),
+        createdAt: e.createdAt || e.listenedAt || null,
+        userId: row.email,
+        userUsername: row.username,
+        userAvatarUrl: row.avatar_url || generateDefaultAvatar(row.email),
+        likes: likeMap.get(String(e.id)) || 0,
+        likedByUser: likedSet.has(String(e.id)),
+        commentCount: commentMap.get(String(e.id)) || 0,
+        isFriend: followedSet.has(String(row.user_id)),
+        isYou: String(row.user_id) === String(req.userId),
+      };
+    });
+
+    // Popular: most liked first, written reviews ahead of bare ratings, then newest.
+    reviews.sort((a, b) => {
+      if (b.likes !== a.likes) return b.likes - a.likes;
+      const at = a.reviewText ? 1 : 0;
+      const bt = b.reviewText ? 1 : 0;
+      if (bt !== at) return bt - at;
+      return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime();
+    });
+
+    res.json({ summary: { averageRating, count, distribution }, reviews: reviews.slice(0, 300) });
+  } catch (error: any) {
+    console.error("Album reviews error:", error);
+    res.status(500).json({ error: "Failed to load album reviews", details: error.message });
   }
 });
 
